@@ -27,18 +27,37 @@ cron, or another scheduler.
 
 - Linux and Bash 4.3 or newer
 - [Mike Farah `yq` v4](https://github.com/mikefarah/yq)
-- `curl`, `flock`, and GNU `timeout`/coreutils
+- `curl`, `flock`, GNU `timeout`/coreutils, and `unzip` for ZIP installation
 
 On Debian or Ubuntu, install the system packages with:
 
 ```bash
-sudo apt-get install bash curl util-linux coreutils
+sudo apt-get install bash curl util-linux coreutils unzip
 ```
 
 Install `yq` v4 using its official package or release instructions. The Python
 package with the same name is not compatible.
 
 ## Quick start
+
+Download the latest version from GitHub:
+
+```bash
+curl -fL \
+  https://github.com/tigusigalpa/watchdog/archive/refs/heads/main.zip \
+  -o watchdog.zip
+unzip watchdog.zip
+cd watchdog-main
+```
+
+Alternatively, clone the repository with Git:
+
+```bash
+git clone https://github.com/tigusigalpa/watchdog.git
+cd watchdog
+```
+
+Install and configure the watchdog:
 
 ```bash
 sudo install -d -m 0755 /opt/service-watchdog
