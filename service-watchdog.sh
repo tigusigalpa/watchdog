@@ -6,7 +6,9 @@ set -uo pipefail
 IFS=$'\n\t'
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+readonly SCRIPT_DIR
+readonly WATCHDOG_VERSION="1.0.3"
 
 CONFIG_FILE="${WATCHDOG_CONFIG:-${SCRIPT_DIR}/config.yaml}"
 ONLY_SERVICE=""
@@ -36,11 +38,13 @@ usage() {
     cat <<EOF
 Usage:
   ${SCRIPT_NAME} [-c /path/to/config.yaml] [-s service_name] [-n]
+  ${SCRIPT_NAME} -V | --version
 
 Options:
   -c FILE   YAML configuration file.
   -s NAME   Check only one configured service.
   -n        Dry run: perform checks, but do not run actions, hooks, or write state.
+  -V        Show version information.
   -h        Show this help.
 
 Environment:
@@ -70,6 +74,8 @@ die() {
     exit 2
 }
 
+# Invoked indirectly by the EXIT trap.
+# shellcheck disable=SC2317
 cleanup() {
     if [[ -n "${TEMP_DIRECTORY:-}" && -d "$TEMP_DIRECTORY" ]]; then
         rm -rf -- "$TEMP_DIRECTORY"
@@ -199,9 +205,10 @@ validate_configuration() {
                         die "Service '${name}': check.success_status must not be empty."
                     for ((status_index = 0; status_index < status_count; status_index++)); do
                         status_code="$(yaml_read ".services[$index].check.success_status[$status_index]")"
-                        [[ "$status_code" =~ ^[0-9]{3}$ ]] &&
-                            (( 10#$status_code >= 100 && 10#$status_code <= 599 )) ||
+                        if ! [[ "$status_code" =~ ^[0-9]{3}$ ]] ||
+                           (( 10#$status_code < 100 || 10#$status_code > 599 )); then
                             die "Service '${name}': invalid success HTTP status: ${status_code}"
+                        fi
                     done
                 fi
                 ;;
@@ -211,8 +218,9 @@ validate_configuration() {
                 [[ -n "$value" && "$value" != *[[:space:]]* ]] ||
                     die "Service '${name}': check.host must not be empty or contain spaces."
                 port="$(yaml_read ".services[$index].check.port")"
-                is_positive_integer "$port" && (( 10#$port <= 65535 )) ||
+                if ! is_positive_integer "$port" || (( 10#$port > 65535 )); then
                     die "Service '${name}': check.port must be from 1 through 65535."
+                fi
                 ;;
             command)
                 validate_command_sequence ".services[$index].check.commands" \
@@ -381,6 +389,8 @@ check_tcp() {
     host="$(yaml_read ".services[$index].check.host")"
     port="$(yaml_read ".services[$index].check.port")"
     timeout_value="$(yaml_read ".services[$index].check.timeout // ${DEFAULT_TIMEOUT}")"
+    # $1 and $2 are intentionally expanded by the inner Bash process.
+    # shellcheck disable=SC2016
     timeout --signal=TERM --kill-after=2s "$timeout_value" \
         bash -c 'exec 3<>"/dev/tcp/$1/$2"' _ "$host" "$port" >/dev/null 2>&1
     command_status=$?
@@ -419,7 +429,8 @@ run_configured_sequence() {
             export WATCHDOG_HTTP_STATUS="$CHECK_HTTP_STATUS"
             export WATCHDOG_CHECK_EXIT="$CHECK_EXIT_CODE"
             export WATCHDOG_EVENT="$label"
-            export WATCHDOG_TIMESTAMP="$(date '+%Y-%m-%d %H:%M:%S%z')"
+            WATCHDOG_TIMESTAMP="$(date '+%Y-%m-%d %H:%M:%S%z')"
+            export WATCHDOG_TIMESTAMP
             timeout --signal=TERM --kill-after=10s "$timeout_value" "${configured_command[@]}"
         ) >"$output_file" 2>&1
         command_status=$?
@@ -481,7 +492,9 @@ check_with_retries() {
 read_state() {
     local service_name="$1"
     local file="${STATE_DIRECTORY}/${service_name}.state" state=""
-    [[ -r "$file" ]] && IFS= read -r state <"$file" || true
+    if [[ -r "$file" ]]; then
+        IFS= read -r state <"$file" || true
+    fi
     case "$state" in healthy|unavailable) printf '%s' "$state" ;; *) printf unknown ;; esac
 }
 
@@ -501,7 +514,9 @@ action_is_due() {
     cooldown="$(yaml_read ".services[$index].actions.cooldown // ${DEFAULT_ACTION_COOLDOWN}")"
     (( cooldown == 0 )) && return 0
     file="${STATE_DIRECTORY}/${service_name}.last-action"
-    [[ -r "$file" ]] && IFS= read -r last_action <"$file" || true
+    if [[ -r "$file" ]]; then
+        IFS= read -r last_action <"$file" || true
+    fi
     [[ "$last_action" =~ ^[0-9]+$ ]] || return 0
     now="$(date '+%s')"
     (( now - last_action >= cooldown ))
@@ -585,11 +600,18 @@ process_service() {
 
 main() {
     local option yq_version service_count index matched=0 name
-    while getopts ':c:s:nh' option; do
+
+    if [[ "${1:-}" == "--version" ]]; then
+        printf '%s %s\n' "$SCRIPT_NAME" "$WATCHDOG_VERSION"
+        exit 0
+    fi
+
+    while getopts ':c:s:nhV' option; do
         case "$option" in
             c) CONFIG_FILE="$OPTARG" ;;
             s) ONLY_SERVICE="$OPTARG" ;;
             n) DRY_RUN=1 ;;
+            V) printf '%s %s\n' "$SCRIPT_NAME" "$WATCHDOG_VERSION"; exit 0 ;;
             h) usage; exit 0 ;;
             :) bootstrap_log CRITICAL "Option -${OPTARG} requires a value."; exit 2 ;;
             \?) bootstrap_log CRITICAL "Unknown option: -${OPTARG}"; usage >&2; exit 2 ;;

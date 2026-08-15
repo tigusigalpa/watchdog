@@ -13,6 +13,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install ShellCheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes shellcheck
+
       - name: Install yq v4
         env:
           YQ_VERSION: v4.47.2
@@ -23,6 +28,9 @@ jobs:
 
       - name: Check Bash syntax
         run: bash -n service-watchdog.sh install.sh tests/smoke.sh
+
+      - name: Run ShellCheck
+        run: shellcheck service-watchdog.sh install.sh tests/smoke.sh
 
       - name: Run smoke test
         run: ./tests/smoke.sh

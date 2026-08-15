@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-readonly PROJECT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+PROJECT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+readonly PROJECT_DIR
 TEST_DIRECTORY="$(mktemp -d)"
 SERVER_PID=""
 PYTHON_BIN="${PYTHON_BIN:-python3}"

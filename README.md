@@ -2,6 +2,11 @@
 
 ![Watchdog Hero Banner](https://i.postimg.cc/YCBRD2hr/watchdog-hero-banner-github.jpg)
 
+[![CI](https://github.com/tigusigalpa/watchdog/actions/workflows/ci.yml/badge.svg)](https://github.com/tigusigalpa/watchdog/actions/workflows/ci.yml)
+[![GitHub release](https://img.shields.io/github/v/release/tigusigalpa/watchdog)](https://github.com/tigusigalpa/watchdog/releases)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Bash 4.3+](https://img.shields.io/badge/bash-4.3%2B-4EAA25?logo=gnubash&logoColor=white)](https://www.gnu.org/software/bash/)
+
 A small, dependency-light Bash watchdog for websites and services. It runs
 configured health checks and executes an explicit command sequence when a
 target stays unavailable after all retry attempts.
@@ -38,16 +43,23 @@ sudo apt-get install bash curl util-linux coreutils unzip
 Install `yq` v4 using its official package or release instructions. The Python
 package with the same name is not compatible.
 
+For example, on Ubuntu with Snap:
+
+```bash
+sudo snap install yq
+yq --version  # Must report Mike Farah yq version v4.x.x
+```
+
 ## Quick start
 
-Download the latest version from GitHub:
+Download the stable `v1.0.3` source archive from GitHub:
 
 ```bash
 curl -fL \
-  https://github.com/tigusigalpa/watchdog/archive/refs/heads/main.zip \
+  https://github.com/tigusigalpa/watchdog/archive/refs/tags/v1.0.3.zip \
   -o watchdog.zip
 unzip watchdog.zip
-cd watchdog-main
+cd watchdog-1.0.3
 ```
 
 Alternatively, clone the repository with Git:
@@ -63,12 +75,17 @@ Install and configure the watchdog:
 sudo install -d -m 0755 /opt/service-watchdog
 sudo install -m 0755 service-watchdog.sh /opt/service-watchdog/
 sudo install -m 0640 config.example.yaml /opt/service-watchdog/config.yaml
-sudo editor /opt/service-watchdog/config.yaml
+sudoedit /opt/service-watchdog/config.yaml
 sudo /opt/service-watchdog/service-watchdog.sh -n
 sudo /opt/service-watchdog/service-watchdog.sh
 ```
 
-Or run `sudo ./install.sh` to install the script and systemd units.
+Or run `sudo ./install.sh` to verify dependencies, install the script and
+example configuration, create runtime directories, install the systemd units,
+and reload systemd. The installer preserves an existing configuration.
+
+To test the development branch instead, clone the repository as shown above or
+download [`main.zip`](https://github.com/tigusigalpa/watchdog/archive/refs/heads/main.zip).
 
 ## Configuration
 
@@ -163,6 +180,7 @@ root-owned environment file or secret manager.
 
 ```text
 service-watchdog.sh [-c FILE] [-s SERVICE] [-n]
+service-watchdog.sh -V | --version
 ```
 
 - `0`: all selected services are healthy and no remediation was attempted
@@ -194,6 +212,7 @@ verify the configuration in dry-run mode:
 
 ```bash
 sudo chmod +x /opt/service-watchdog/service-watchdog.sh
+sudo install -d -m 0750 /var/log/service-watchdog
 sudo /opt/service-watchdog/service-watchdog.sh \
   -c /etc/service-watchdog/config.yaml \
   -n
@@ -231,6 +250,59 @@ The global `flock` lock prevents overlapping cron runs. Exit code `1` is an
 expected result when a target remains unavailable or remediation was attempted;
 cron can continue scheduling subsequent runs normally.
 
+## Troubleshooting
+
+### `yq: command not found` or unsupported `yq` version
+
+Install [Mike Farah `yq` v4](https://github.com/mikefarah/yq). The unrelated
+Python package named `yq` is not compatible. Verify the installed binary:
+
+```bash
+yq --version
+```
+
+### Configuration file permission denied
+
+Keep the configuration readable by the account running the watchdog and
+writable only by an administrator:
+
+```bash
+sudo chown root:root /etc/service-watchdog/config.yaml
+sudo chmod 0640 /etc/service-watchdog/config.yaml
+```
+
+When running as a non-root service account, set an appropriate group instead of
+weakening permissions for all users.
+
+### Cron does not create its log
+
+The shell opens redirection targets before it starts the watchdog. Create the
+log directory before installing the crontab entry:
+
+```bash
+sudo install -d -m 0750 /var/log/service-watchdog
+```
+
+### Remediation command fails with permission denied
+
+Run the watchdog under an account that can execute the configured action. For
+Docker, verify socket/group access; for `systemctl`, use root's timer or a
+narrowly scoped sudo/polkit rule. Do not make the configuration world-writable.
+
+### A scheduled run is skipped
+
+The watchdog intentionally skips a run when another instance holds the global
+`flock` lock. Check whether a previous command is still running and review its
+configured timeout before increasing the schedule interval.
+
+### Understanding exit codes
+
+- `0` means all selected targets were healthy and no remediation ran.
+- `1` means a target was unavailable or remediation was attempted; this is an
+  expected monitoring result.
+- `2` means the watchdog encountered a configuration, dependency, or runtime
+  error.
+
 ## Security notes
 
 - Run with the least privileges required by remediation commands.
@@ -243,7 +315,8 @@ cron can continue scheduling subsequent runs normally.
 ## Testing
 
 ```bash
-bash -n service-watchdog.sh tests/smoke.sh
+bash -n service-watchdog.sh install.sh tests/smoke.sh
+shellcheck service-watchdog.sh install.sh tests/smoke.sh
 ./tests/smoke.sh
 ```
 
