@@ -28,7 +28,7 @@ if (( BASH_VERSINFO[0] < 4 ||
 fi
 
 missing_dependency=0
-for command_name in curl flock install systemctl timeout yq; do
+for command_name in base64 curl flock install systemctl timeout yq; do
     require_command "$command_name" || missing_dependency=1
 done
 (( missing_dependency == 0 )) || exit 1

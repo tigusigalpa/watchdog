@@ -8,7 +8,7 @@ IFS=$'\n\t'
 readonly SCRIPT_NAME="${0##*/}"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 readonly SCRIPT_DIR
-readonly WATCHDOG_VERSION="1.0.3"
+readonly WATCHDOG_VERSION="1.0.6"
 
 CONFIG_FILE="${WATCHDOG_CONFIG:-${SCRIPT_DIR}/config.yaml}"
 ONLY_SERVICE=""
@@ -30,6 +30,21 @@ CHECK_HTTP_STATUS=""
 CHECK_EXIT_CODE=""
 CURRENT_SERVICE=""
 CURRENT_CHECK_TYPE=""
+CURRENT_ACTION_STATUS="not-attempted"
+
+EMAIL_ENABLED=0
+EMAIL_SMTP_URL=""
+EMAIL_FROM=""
+EMAIL_USERNAME=""
+EMAIL_PASSWORD=""
+EMAIL_TLS_REQUIRED=1
+EMAIL_INSECURE_SKIP_VERIFY=0
+EMAIL_TIMEOUT=30
+EMAIL_RECIPIENTS_COUNT=0
+EMAIL_FAILURE_SUBJECT=""
+EMAIL_FAILURE_BODY=""
+EMAIL_RECOVERY_SUBJECT=""
+EMAIL_RECOVERY_BODY=""
 
 ACTION_ATTEMPTED=0
 UNHEALTHY_FOUND=0
@@ -157,6 +172,83 @@ validate_command_sequence() {
     done
 }
 
+validate_email_configuration() {
+    local enabled value value_type password_env password recipients_type
+    local recipient recipient_index timeout_value
+
+    enabled="$(yaml_read '.notifications.email.enabled // false')"
+    case "$enabled" in
+        false) return 0 ;;
+        true) ;;
+        *) die "notifications.email.enabled must be true or false." ;;
+    esac
+
+    validate_string '.notifications.email.smtp.url' 'notifications.email.smtp.url'
+    validate_string '.notifications.email.smtp.from' 'notifications.email.smtp.from'
+    validate_string '.notifications.email.failure.subject' 'notifications.email.failure.subject'
+    validate_string '.notifications.email.failure.body' 'notifications.email.failure.body'
+    validate_string '.notifications.email.recovery.subject' 'notifications.email.recovery.subject'
+    validate_string '.notifications.email.recovery.body' 'notifications.email.recovery.body'
+
+    value="$(yaml_read '.notifications.email.smtp.url')"
+    [[ "$value" =~ ^smtps?://[^[:space:]]+$ ]] ||
+        die "notifications.email.smtp.url must start with smtp:// or smtps:// and contain no spaces."
+    value="$(yaml_read '.notifications.email.smtp.from')"
+    [[ "$value" =~ ^[^[:space:]@]+@[^[:space:]@]+$ ]] ||
+        die "notifications.email.smtp.from must be one email address."
+
+    for value in failure recovery; do
+        value_type="$(yaml_read ".notifications.email.${value}.subject")"
+        [[ "$value_type" != *$'\n'* && "$value_type" != *$'\r'* ]] ||
+            die "notifications.email.${value}.subject must be a single line."
+    done
+
+    value_type="$(yaml_read '.notifications.email.smtp.username | type')"
+    [[ "$value_type" == "!!null" ]] ||
+        validate_string '.notifications.email.smtp.username' 'notifications.email.smtp.username'
+    value_type="$(yaml_read '.notifications.email.smtp.password_env | type')"
+    [[ "$value_type" == "!!null" ]] ||
+        validate_string '.notifications.email.smtp.password_env' 'notifications.email.smtp.password_env'
+    value_type="$(yaml_read '.notifications.email.smtp.password | type')"
+    [[ "$value_type" == "!!null" ]] ||
+        validate_string '.notifications.email.smtp.password' 'notifications.email.smtp.password'
+
+    password_env="$(yaml_read '.notifications.email.smtp.password_env // ""')"
+    password="$(yaml_read '.notifications.email.smtp.password // ""')"
+    [[ -z "$password_env" || -z "$password" ]] ||
+        die "Use only one of notifications.email.smtp.password_env or password."
+    if [[ -n "$password_env" ]]; then
+        [[ "$password_env" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] ||
+            die "notifications.email.smtp.password_env is not a valid environment variable name."
+    fi
+
+    value_type="$(yaml_read '.notifications.email.smtp.tls_required // true')"
+    [[ "$value_type" == true || "$value_type" == false ]] ||
+        die "notifications.email.smtp.tls_required must be true or false."
+    value_type="$(yaml_read '.notifications.email.smtp.insecure_skip_verify // false')"
+    [[ "$value_type" == true || "$value_type" == false ]] ||
+        die "notifications.email.smtp.insecure_skip_verify must be true or false."
+
+    timeout_value="$(yaml_read '.notifications.email.smtp.timeout // 30')"
+    if ! is_positive_integer "$timeout_value" || (( 10#$timeout_value > 60 )); then
+        die "notifications.email.smtp.timeout must be from 1 through 60 seconds."
+    fi
+
+    recipients_type="$(yaml_read '.notifications.email.recipients | type')"
+    [[ "$recipients_type" == "!!seq" ]] ||
+        die "notifications.email.recipients must be a YAML array."
+    EMAIL_RECIPIENTS_COUNT="$(yaml_read '.notifications.email.recipients | length')"
+    (( EMAIL_RECIPIENTS_COUNT > 0 )) ||
+        die "notifications.email.recipients must not be empty."
+    for ((recipient_index = 0; recipient_index < EMAIL_RECIPIENTS_COUNT; recipient_index++)); do
+        validate_string ".notifications.email.recipients[$recipient_index]" \
+            "notifications.email.recipients[$recipient_index]"
+        recipient="$(yaml_read ".notifications.email.recipients[$recipient_index]")"
+        [[ "$recipient" =~ ^[^[:space:]@]+@[^[:space:]@]+$ ]] ||
+            die "Invalid email address in notifications.email.recipients[$recipient_index]."
+    done
+}
+
 validate_configuration() {
     local services_type service_count index name enabled check_type value value_type
     local status_count status_index status_code port actions_type hooks_type hook_name
@@ -267,6 +359,8 @@ validate_configuration() {
             fi
         done
     fi
+
+    validate_email_configuration
 }
 
 configure_runtime() {
@@ -305,6 +399,44 @@ configure_runtime() {
     chmod 0750 "$STATE_DIRECTORY" 2>/dev/null || true
 }
 
+configure_email() {
+    local enabled password_env password
+
+    enabled="$(yaml_read '.notifications.email.enabled // false')"
+    [[ "$enabled" == true ]] || return 0
+    EMAIL_ENABLED=1
+    EMAIL_SMTP_URL="$(yaml_read '.notifications.email.smtp.url')"
+    EMAIL_FROM="$(yaml_read '.notifications.email.smtp.from')"
+    EMAIL_USERNAME="$(yaml_read '.notifications.email.smtp.username // ""')"
+    EMAIL_TLS_REQUIRED=0
+    EMAIL_INSECURE_SKIP_VERIFY=0
+    [[ "$(yaml_read '.notifications.email.smtp.tls_required // true')" == true ]] &&
+        EMAIL_TLS_REQUIRED=1
+    [[ "$(yaml_read '.notifications.email.smtp.insecure_skip_verify // false')" == true ]] &&
+        EMAIL_INSECURE_SKIP_VERIFY=1
+    EMAIL_TIMEOUT="$(yaml_read '.notifications.email.smtp.timeout // 30')"
+    EMAIL_RECIPIENTS_COUNT="$(yaml_read '.notifications.email.recipients | length')"
+    EMAIL_FAILURE_SUBJECT="$(yaml_read '.notifications.email.failure.subject')"
+    EMAIL_FAILURE_BODY="$(yaml_read '.notifications.email.failure.body')"
+    EMAIL_RECOVERY_SUBJECT="$(yaml_read '.notifications.email.recovery.subject')"
+    EMAIL_RECOVERY_BODY="$(yaml_read '.notifications.email.recovery.body')"
+
+    password_env="$(yaml_read '.notifications.email.smtp.password_env // ""')"
+    password="$(yaml_read '.notifications.email.smtp.password // ""')"
+    if [[ -n "$password_env" ]]; then
+        EMAIL_PASSWORD="${!password_env:-}"
+        [[ -n "$EMAIL_PASSWORD" ]] ||
+            die "SMTP password environment variable is empty or undefined: ${password_env}"
+    else
+        EMAIL_PASSWORD="$password"
+    fi
+
+    [[ -z "$EMAIL_USERNAME" || -n "$EMAIL_PASSWORD" ]] ||
+        die "SMTP username is configured, but no password is available."
+    [[ -n "$EMAIL_USERNAME" || -z "$EMAIL_PASSWORD" ]] ||
+        die "SMTP password is configured, but smtp.username is empty."
+}
+
 load_command() {
     local expression="$1"
     local -n result_ref="$2"
@@ -330,6 +462,101 @@ format_command() {
 
 sanitize_detail() {
     printf '%s' "$1" | tail -c 4096 | tr '\r\n' '  '
+}
+
+render_email_template() {
+    local template="$1"
+    local event="$2"
+    local timestamp="$3"
+    local detail
+    detail="$(sanitize_detail "$CHECK_DETAIL")"
+
+    template="${template//\{\{service\}\}/$CURRENT_SERVICE}"
+    template="${template//\{\{event\}\}/$event}"
+    template="${template//\{\{timestamp\}\}/$timestamp}"
+    template="${template//\{\{check_type\}\}/$CURRENT_CHECK_TYPE}"
+    template="${template//\{\{detail\}\}/$detail}"
+    template="${template//\{\{http_status\}\}/${CHECK_HTTP_STATUS:-n/a}}"
+    template="${template//\{\{check_exit\}\}/${CHECK_EXIT_CODE:-n/a}}"
+    template="${template//\{\{action_status\}\}/$CURRENT_ACTION_STATUS}"
+    printf '%s' "$template"
+}
+
+send_email_notification() {
+    local event="$1"
+    local timestamp subject_template body_template subject body encoded_subject
+    local message_file recipient recipients_header="" output command_status recipient_index
+    local -a curl_command
+
+    (( EMAIL_ENABLED == 1 )) || return 0
+    case "$event" in
+        failure)
+            subject_template="$EMAIL_FAILURE_SUBJECT"
+            body_template="$EMAIL_FAILURE_BODY"
+            ;;
+        recovery)
+            subject_template="$EMAIL_RECOVERY_SUBJECT"
+            body_template="$EMAIL_RECOVERY_BODY"
+            ;;
+        *)
+            log ERROR "service=${CURRENT_SERVICE} result=email-failed reason=unknown-event event=${event}"
+            return 1
+            ;;
+    esac
+
+    timestamp="$(date '+%Y-%m-%d %H:%M:%S%z')"
+    subject="$(render_email_template "$subject_template" "$event" "$timestamp")"
+    subject="${subject//$'\r'/ }"
+    subject="${subject//$'\n'/ }"
+    body="$(render_email_template "$body_template" "$event" "$timestamp")"
+    encoded_subject="$(printf '%s' "$subject" | base64 | tr -d '\r\n')"
+    message_file="${TEMP_DIRECTORY}/email-${RANDOM}-${RANDOM}.eml"
+
+    curl_command=(
+        curl
+        --silent
+        --show-error
+        --url "$EMAIL_SMTP_URL"
+        --connect-timeout "$EMAIL_TIMEOUT"
+        --max-time "$EMAIL_TIMEOUT"
+        --mail-from "$EMAIL_FROM"
+    )
+    (( EMAIL_TLS_REQUIRED == 1 )) && curl_command+=(--ssl-reqd)
+    (( EMAIL_INSECURE_SKIP_VERIFY == 1 )) && curl_command+=(--insecure)
+    if [[ -n "$EMAIL_USERNAME" ]]; then
+        curl_command+=(--user "${EMAIL_USERNAME}:${EMAIL_PASSWORD}")
+    fi
+
+    for ((recipient_index = 0; recipient_index < EMAIL_RECIPIENTS_COUNT; recipient_index++)); do
+        recipient="$(yaml_read ".notifications.email.recipients[$recipient_index]")"
+        curl_command+=(--mail-rcpt "$recipient")
+        [[ -z "$recipients_header" ]] || recipients_header+=", "
+        recipients_header+="$recipient"
+    done
+
+    {
+        printf 'From: %s\r\n' "$EMAIL_FROM"
+        printf 'To: %s\r\n' "$recipients_header"
+        printf 'Subject: =?UTF-8?B?%s?=\r\n' "$encoded_subject"
+        printf 'Date: %s\r\n' "$(date -R)"
+        printf 'MIME-Version: 1.0\r\n'
+        printf 'Content-Type: text/plain; charset=UTF-8\r\n'
+        printf 'Content-Transfer-Encoding: 8bit\r\n'
+        printf '\r\n%s\r\n' "$body"
+    } >"$message_file"
+
+    log INFO "service=${CURRENT_SERVICE} action=email event=${event} recipients=${EMAIL_RECIPIENTS_COUNT}"
+    output="$("${curl_command[@]}" --upload-file "$message_file" 2>&1)"
+    command_status=$?
+    rm -f -- "$message_file"
+    output="$(sanitize_detail "$output")"
+
+    if (( command_status == 0 )); then
+        log INFO "service=${CURRENT_SERVICE} result=email-sent event=${event} recipients=${EMAIL_RECIPIENTS_COUNT}"
+        return 0
+    fi
+    log ERROR "service=${CURRENT_SERVICE} result=email-failed event=${event} curl_exit=${command_status} error=${output:-unknown}"
+    return 1
 }
 
 http_status_is_successful() {
@@ -534,13 +761,23 @@ record_action_attempt() {
 
 handle_state_transition() {
     local service_name="$1" new_state="$2"
-    local previous hook_expression
+    local previous hook_expression notification_event
     (( DRY_RUN == 0 )) || return 0
     previous="$(read_state "$service_name")"
     [[ "$previous" != "$new_state" ]] || return 0
     hook_expression=""
-    [[ "$new_state" == unavailable ]] && hook_expression='.hooks.on_failure'
-    [[ "$new_state" == healthy && "$previous" == unavailable ]] && hook_expression='.hooks.on_recovery'
+    notification_event=""
+    if [[ "$new_state" == unavailable ]]; then
+        hook_expression='.hooks.on_failure'
+        notification_event=failure
+    elif [[ "$new_state" == healthy && "$previous" == unavailable ]]; then
+        hook_expression='.hooks.on_recovery'
+        notification_event=recovery
+    fi
+    if [[ -n "$notification_event" ]]; then
+        send_email_notification "$notification_event" ||
+            log ERROR "service=${service_name} result=state-email-failed state=${new_state}"
+    fi
     if [[ -n "$hook_expression" ]]; then
         run_configured_sequence "$hook_expression" "${new_state}" "$service_name" ||
             log ERROR "service=${service_name} result=state-hook-failed state=${new_state}"
@@ -551,9 +788,13 @@ handle_state_transition() {
 
 process_service() {
     local index="$1"
-    local enabled actions_count verify_after final_state
+    local enabled actions_count verify_after action_due=0
     CURRENT_SERVICE="$(yaml_read ".services[$index].name")"
     CURRENT_CHECK_TYPE="$(yaml_read ".services[$index].check.type")"
+    CURRENT_ACTION_STATUS="not-attempted"
+    CHECK_DETAIL=""
+    CHECK_HTTP_STATUS=""
+    CHECK_EXIT_CODE=""
     enabled="$(yaml_read ".services[$index].enabled // true")"
 
     [[ -z "$ONLY_SERVICE" || "$CURRENT_SERVICE" == "$ONLY_SERVICE" ]] || return 0
@@ -564,27 +805,51 @@ process_service() {
 
     log INFO "service=${CURRENT_SERVICE} action=service-start type=${CURRENT_CHECK_TYPE}"
     if check_with_retries "$index"; then
+        CURRENT_ACTION_STATUS="not-required"
         handle_state_transition "$CURRENT_SERVICE" healthy
         log INFO "service=${CURRENT_SERVICE} result=healthy"
         return 0
     fi
 
     actions_count="$(yaml_read ".services[$index].actions.commands // [] | length")"
+    if (( actions_count == 0 )); then
+        CURRENT_ACTION_STATUS="not-configured"
+    elif (( DRY_RUN == 1 )); then
+        CURRENT_ACTION_STATUS="skipped-dry-run"
+    elif action_is_due "$index" "$CURRENT_SERVICE"; then
+        CURRENT_ACTION_STATUS="pending"
+        action_due=1
+    else
+        CURRENT_ACTION_STATUS="cooldown"
+    fi
+
+    # Record and notify the incident before remediation. The state transition
+    # guarantees that a continuing outage does not generate duplicate email.
+    handle_state_transition "$CURRENT_SERVICE" unavailable
+
     if (( actions_count > 0 )); then
         if (( DRY_RUN == 1 )); then
             log WARN "service=${CURRENT_SERVICE} action=remediation result=skipped reason=dry-run"
-        elif action_is_due "$index" "$CURRENT_SERVICE"; then
+        elif (( action_due == 1 )); then
             ACTION_ATTEMPTED=1
             record_action_attempt "$CURRENT_SERVICE"
             log WARN "service=${CURRENT_SERVICE} action=remediation-start commands=${actions_count}"
-            run_configured_sequence ".services[$index].actions.commands" remediation "$CURRENT_SERVICE" || true
+            if run_configured_sequence ".services[$index].actions.commands" remediation "$CURRENT_SERVICE"; then
+                CURRENT_ACTION_STATUS="commands-succeeded"
+            else
+                CURRENT_ACTION_STATUS="command-failed"
+            fi
 
             verify_after="$(yaml_read ".services[$index].actions.verify_after // 0")"
             (( verify_after > 0 )) && sleep "$verify_after"
             if check_with_retries "$index"; then
+                CURRENT_ACTION_STATUS="successful"
                 handle_state_transition "$CURRENT_SERVICE" healthy
                 log WARN "service=${CURRENT_SERVICE} result=recovered-after-remediation"
                 return 0
+            fi
+            if [[ "$CURRENT_ACTION_STATUS" == commands-succeeded ]]; then
+                CURRENT_ACTION_STATUS="verification-failed"
             fi
         else
             log WARN "service=${CURRENT_SERVICE} action=remediation result=skipped reason=cooldown"
@@ -592,8 +857,6 @@ process_service() {
     fi
 
     UNHEALTHY_FOUND=1
-    final_state=unavailable
-    handle_state_transition "$CURRENT_SERVICE" "$final_state"
     log ERROR "service=${CURRENT_SERVICE} result=unavailable detail=\"$(sanitize_detail "$CHECK_DETAIL")\""
     return 0
 }
@@ -619,7 +882,7 @@ main() {
     done
 
     [[ -f "$CONFIG_FILE" ]] || die "Configuration file not found: ${CONFIG_FILE}"
-    for name in bash curl yq flock timeout date dirname mktemp tail tr mv env; do
+    for name in bash base64 curl yq flock timeout date dirname mktemp tail tr mv env; do
         require_command "$name"
     done
     yq_version="$(yq --version 2>/dev/null)" || die "Cannot determine yq version."
@@ -627,6 +890,7 @@ main() {
 
     validate_configuration
     configure_runtime
+    configure_email
     TEMP_DIRECTORY="$(mktemp -d)" || die "Cannot create temporary directory."
     exec 9>"$LOCK_FILE" || die "Cannot open lock file: ${LOCK_FILE}"
     if ! flock --nonblock 9; then

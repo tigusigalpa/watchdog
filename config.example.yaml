@@ -9,6 +9,50 @@ settings:
   default_action_timeout: 120
   default_action_cooldown: 300
 
+# Built-in email is transition-based: one message when a service becomes
+# unavailable and one message when it becomes healthy again.
+notifications:
+  email:
+    enabled: false
+
+    smtp:
+      url: smtps://smtp.example.com:465
+      from: watchdog@example.com
+      username: watchdog@example.com
+      password_env: WATCHDOG_SMTP_PASSWORD
+      tls_required: true
+      insecure_skip_verify: false
+      timeout: 30
+
+    recipients:
+      - ops@example.com
+
+    failure:
+      subject: "[watchdog] {{service}} is unavailable"
+      body: |-
+        A service availability problem was detected.
+
+        Service: {{service}}
+        Time: {{timestamp}}
+        Check: {{check_type}}
+        Detail: {{detail}}
+        HTTP status: {{http_status}}
+        Check exit: {{check_exit}}
+        Remediation: {{action_status}}
+
+        This alert is sent once and will not repeat until the service recovers.
+
+    recovery:
+      subject: "[watchdog] {{service}} recovered"
+      body: |-
+        The service is available again.
+
+        Service: {{service}}
+        Time: {{timestamp}}
+        Check: {{check_type}}
+        Detail: {{detail}}
+        Remediation: {{action_status}}
+
 # Optional commands invoked only when a service changes state. Every command
 # receives WATCHDOG_SERVICE, WATCHDOG_EVENT, WATCHDOG_DETAIL,
 # WATCHDOG_CHECK_TYPE, WATCHDOG_HTTP_STATUS, and WATCHDOG_CHECK_EXIT.

@@ -1,0 +1,68 @@
+settings:
+  log_file: /var/log/service-watchdog/service-watchdog.log
+  lock_file: /run/lock/service-watchdog.lock
+  state_directory: /var/lib/service-watchdog
+
+  default_timeout: 10
+  default_attempts: 2
+  default_retry_delay: 2
+  default_action_timeout: 120
+  default_action_cooldown: 300
+
+notifications:
+  email:
+    enabled: true
+    smtp:
+      url: smtps://smtp.example.com:465
+      from: watchdog@example.com
+      username: watchdog@example.com
+      password_env: WATCHDOG_SMTP_PASSWORD
+      tls_required: true
+      insecure_skip_verify: false
+      timeout: 30
+
+    recipients:
+      - administrator@example.com
+      - on-call@example.com
+
+    failure:
+      subject: "[watchdog] {{service}} is unavailable"
+      body: |-
+        Watchdog detected a service problem.
+
+        Service: {{service}}
+        Time: {{timestamp}}
+        Check type: {{check_type}}
+        Detail: {{detail}}
+        HTTP status: {{http_status}}
+        Check exit: {{check_exit}}
+        Remediation: {{action_status}}
+
+        No further failure messages will be sent until recovery.
+
+    recovery:
+      subject: "[watchdog] {{service}} recovered"
+      body: |-
+        Watchdog confirmed that the service is available again.
+
+        Service: {{service}}
+        Time: {{timestamp}}
+        Check type: {{check_type}}
+        Detail: {{detail}}
+        Remediation: {{action_status}}
+
+services:
+  - name: public-api
+    check:
+      type: http
+      url: https://api.example.com/health
+      success_status: [200, 204]
+      timeout: 10
+      attempts: 2
+      retry_delay: 2
+
+    actions:
+      cooldown: 300
+      verify_after: 5
+      commands:
+        - command: [systemctl, restart, example-api]

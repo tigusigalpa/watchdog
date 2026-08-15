@@ -27,10 +27,13 @@ jobs:
           sudo chmod +x /usr/local/bin/yq
 
       - name: Check Bash syntax
-        run: bash -n service-watchdog.sh install.sh tests/smoke.sh
+        run: bash -n service-watchdog.sh install.sh tests/smoke.sh tests/email-notifications.sh
 
       - name: Run ShellCheck
-        run: shellcheck service-watchdog.sh install.sh tests/smoke.sh
+        run: shellcheck service-watchdog.sh install.sh tests/smoke.sh tests/email-notifications.sh
 
       - name: Run smoke test
         run: bash ./tests/smoke.sh
+
+      - name: Test email notifications
+        run: bash ./tests/email-notifications.sh

@@ -11,6 +11,7 @@ service names, and commands before enabling scheduled runs.
 | [`command-check.yaml`](command-check.yaml) | Use a local command as the health check |
 | [`multiple-services.yaml`](multiple-services.yaml) | Monitor HTTP, TCP, and systemd services in one run |
 | [`hooks.yaml`](hooks.yaml) | Run notification hooks on failure and recovery transitions |
+| [`smtp-email.yaml`](smtp-email.yaml) | Send built-in SMTP email on failure and recovery transitions |
 
 Test a configuration without executing remediation commands or changing state:
 
@@ -32,4 +33,3 @@ sudo ./service-watchdog.sh \
 The paths in the examples are intentionally illustrative. Configuration
 validation will fail until referenced working directories exist on the target
 server.
-
