@@ -1,5 +1,7 @@
 # Watchdog
 
+![Watchdog Hero Banner](https://i.postimg.cc/YCBRD2hr/watchdog-hero-banner-github.jpg)
+
 A small, dependency-light Bash watchdog for websites and services. It runs
 configured health checks and executes an explicit command sequence when a
 target stays unavailable after all retry attempts.
