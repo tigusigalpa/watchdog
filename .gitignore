@@ -1,0 +1,87 @@
+# Local configuration and secrets
+config.yaml
+config.local.yaml
+config.*.local.yaml
+config.secret.yaml
+config.*.secret.yaml
+.env
+.env.*
+!.env.example
+environment
+*.key
+*.pem
+*.p12
+*.pfx
+*.crt
+*.credentials
+*.secret
+
+# Runtime data
+*.log
+*.log.*
+*.pid
+*.lock
+*.state
+*.last-action
+logs/
+state/
+run/
+
+# Temporary files and test artifacts
+.test-bin/
+.tmp/
+tmp/
+temp/
+coverage/
+test-results/
+*.tmp
+*.temp
+*.bak
+*.old
+*.orig
+*.rej
+*~
+
+# IDEs and editors
+.idea/
+*.iml
+*.ipr
+*.iws
+.vscode/
+!.vscode/extensions.json
+!.vscode/settings.example.json
+.fleet/
+.zed/
+*.swp
+*.swo
+*.swn
+
+# Operating-system metadata
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+.Spotlight-V100/
+.Trashes/
+
+# Tool caches and reports
+.cache/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.shellcheckrc.local
+*.lcov
+
+# Archives and release artifacts
+dist/
+build/
+release/
+*.tar
+*.tar.gz
+*.tgz
+*.zip

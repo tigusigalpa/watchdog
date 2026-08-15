@@ -1,0 +1,76 @@
+settings:
+  log_file: /var/log/service-watchdog/service-watchdog.log
+  lock_file: /run/lock/service-watchdog.lock
+  state_directory: /var/lib/service-watchdog
+
+  default_timeout: 10
+  default_attempts: 2
+  default_retry_delay: 2
+  default_action_timeout: 120
+  default_action_cooldown: 300
+
+# Optional commands invoked only when a service changes state. Every command
+# receives WATCHDOG_SERVICE, WATCHDOG_EVENT, WATCHDOG_DETAIL,
+# WATCHDOG_CHECK_TYPE, WATCHDOG_HTTP_STATUS, and WATCHDOG_CHECK_EXIT.
+hooks:
+  on_failure: []
+  on_recovery: []
+
+services:
+  - name: example-website
+    check:
+      type: http
+      url: https://example.com/health
+      method: GET
+      follow_redirects: true
+      success_status:
+        - 200
+      timeout: 10
+      attempts: 2
+      retry_delay: 2
+
+    actions:
+      cooldown: 300
+      verify_after: 5
+      commands:
+        - command:
+            - docker
+            - compose
+            - restart
+            - web
+          working_directory: /srv/example
+          timeout: 120
+
+  - name: local-postgresql
+    check:
+      type: tcp
+      host: 127.0.0.1
+      port: 5432
+
+    actions:
+      cooldown: 300
+      verify_after: 3
+      commands:
+        - command:
+            - systemctl
+            - restart
+            - postgresql
+
+  - name: background-worker
+    check:
+      type: command
+      attempts: 1
+      commands:
+        - command:
+            - systemctl
+            - is-active
+            - --quiet
+            - example-worker
+    actions:
+      cooldown: 300
+      verify_after: 2
+      commands:
+        - command:
+            - systemctl
+            - restart
+            - example-worker

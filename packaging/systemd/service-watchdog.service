@@ -1,0 +1,18 @@
+[Unit]
+Description=Check configured services and perform remediation
+Documentation=https://github.com/tigusigalpa/watchdog
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/service-watchdog/service-watchdog.sh -c /etc/service-watchdog/config.yaml
+EnvironmentFile=-/etc/service-watchdog/environment
+SuccessExitStatus=1
+User=root
+Group=root
+UMask=0027
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=full
