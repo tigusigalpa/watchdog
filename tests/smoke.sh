@@ -3,6 +3,7 @@ set -euo pipefail
 
 PROJECT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 readonly PROJECT_DIR
+readonly WATCHDOG_SCRIPT="${PROJECT_DIR}/service-watchdog.sh"
 TEST_DIRECTORY="$(mktemp -d)"
 SERVER_PID=""
 PYTHON_BIN="${PYTHON_BIN:-python3}"
@@ -65,7 +66,7 @@ services:
         - command: [touch, ${TEST_DIRECTORY}/remediation-ran]
 EOF
 
-"${PROJECT_DIR}/service-watchdog.sh" -c "${TEST_DIRECTORY}/config.yaml" -s smoke-http
+bash "$WATCHDOG_SCRIPT" -c "${TEST_DIRECTORY}/config.yaml" -s smoke-http
 [[ ! -e "${TEST_DIRECTORY}/remediation-ran" ]]
 [[ "$(<"${TEST_DIRECTORY}/state/smoke-http.state")" == healthy ]]
 
@@ -74,7 +75,7 @@ wait "$SERVER_PID" 2>/dev/null || true
 SERVER_PID=""
 
 set +e
-"${PROJECT_DIR}/service-watchdog.sh" -c "${TEST_DIRECTORY}/config.yaml" -s smoke-http
+bash "$WATCHDOG_SCRIPT" -c "${TEST_DIRECTORY}/config.yaml" -s smoke-http
 watchdog_status=$?
 set -e
 
