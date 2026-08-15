@@ -1,0 +1,41 @@
+settings:
+  log_file: /var/log/service-watchdog/service-watchdog.log
+  lock_file: /run/lock/service-watchdog.lock
+  state_directory: /var/lib/service-watchdog
+
+  default_timeout: 10
+  default_attempts: 2
+  default_retry_delay: 2
+  default_action_timeout: 120
+  default_action_cooldown: 300
+
+# Hook commands receive WATCHDOG_SERVICE, WATCHDOG_EVENT, WATCHDOG_DETAIL,
+# WATCHDOG_CHECK_TYPE, WATCHDOG_HTTP_STATUS, WATCHDOG_CHECK_EXIT, and
+# WATCHDOG_TIMESTAMP. Replace the example script path with your integration.
+hooks:
+  on_failure:
+    - command:
+        - /usr/local/bin/notify-watchdog
+      timeout: 30
+
+  on_recovery:
+    - command:
+        - /usr/local/bin/notify-watchdog
+      timeout: 30
+
+services:
+  - name: storefront
+    check:
+      type: http
+      url: https://shop.example.com/health
+      success_status: [200]
+      timeout: 10
+      attempts: 2
+      retry_delay: 2
+
+    actions:
+      cooldown: 300
+      verify_after: 5
+      commands:
+        - command: [systemctl, restart, storefront]
+

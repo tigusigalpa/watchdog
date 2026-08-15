@@ -1,0 +1,38 @@
+settings:
+  log_file: /var/log/service-watchdog/service-watchdog.log
+  lock_file: /run/lock/service-watchdog.lock
+  state_directory: /var/lib/service-watchdog
+
+  default_timeout: 10
+  default_attempts: 2
+  default_retry_delay: 2
+  default_action_timeout: 120
+  default_action_cooldown: 300
+
+services:
+  - name: public-api
+    check:
+      type: http
+      url: https://api.example.com/health
+      method: GET
+      follow_redirects: true
+      success_status:
+        - 200
+        - 204
+      timeout: 10
+      attempts: 2
+      retry_delay: 2
+
+    actions:
+      cooldown: 300
+      verify_after: 5
+      commands:
+        - command:
+            - docker
+            - compose
+            - restart
+            - api
+            - nginx
+          working_directory: /srv/example-api
+          timeout: 120
+

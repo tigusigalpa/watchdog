@@ -1,0 +1,35 @@
+settings:
+  log_file: /var/log/service-watchdog/service-watchdog.log
+  lock_file: /run/lock/service-watchdog.lock
+  state_directory: /var/lib/service-watchdog
+
+  default_timeout: 10
+  default_attempts: 2
+  default_retry_delay: 2
+  default_action_timeout: 60
+  default_action_cooldown: 300
+
+services:
+  - name: background-worker
+    check:
+      type: command
+      attempts: 2
+      retry_delay: 2
+      commands:
+        - command:
+            - systemctl
+            - is-active
+            - --quiet
+            - example-worker
+          timeout: 10
+
+    actions:
+      cooldown: 300
+      verify_after: 2
+      commands:
+        - command:
+            - systemctl
+            - restart
+            - example-worker
+          timeout: 60
+

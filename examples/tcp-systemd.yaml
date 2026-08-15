@@ -1,0 +1,31 @@
+settings:
+  log_file: /var/log/service-watchdog/service-watchdog.log
+  lock_file: /run/lock/service-watchdog.lock
+  state_directory: /var/lib/service-watchdog
+
+  default_timeout: 5
+  default_attempts: 3
+  default_retry_delay: 2
+  default_action_timeout: 60
+  default_action_cooldown: 300
+
+services:
+  - name: postgresql
+    check:
+      type: tcp
+      host: 127.0.0.1
+      port: 5432
+      timeout: 5
+      attempts: 3
+      retry_delay: 2
+
+    actions:
+      cooldown: 300
+      verify_after: 3
+      commands:
+        - command:
+            - systemctl
+            - restart
+            - postgresql
+          timeout: 60
+

@@ -1,0 +1,49 @@
+settings:
+  log_file: /var/log/service-watchdog/service-watchdog.log
+  lock_file: /run/lock/service-watchdog.lock
+  state_directory: /var/lib/service-watchdog
+
+  default_timeout: 10
+  default_attempts: 2
+  default_retry_delay: 2
+  default_action_timeout: 120
+  default_action_cooldown: 300
+
+services:
+  - name: public-api
+    check:
+      type: http
+      url: https://api.example.com/health
+      success_status: [200, 204]
+    actions:
+      cooldown: 300
+      verify_after: 5
+      commands:
+        - command: [docker, compose, restart, api]
+          working_directory: /srv/example-api
+
+  - name: redis
+    check:
+      type: tcp
+      host: 127.0.0.1
+      port: 6379
+      timeout: 3
+    actions:
+      cooldown: 300
+      verify_after: 2
+      commands:
+        - command: [systemctl, restart, redis-server]
+
+  - name: queue-worker
+    check:
+      type: command
+      attempts: 1
+      commands:
+        - command: [systemctl, is-active, --quiet, queue-worker]
+          timeout: 10
+    actions:
+      cooldown: 300
+      verify_after: 2
+      commands:
+        - command: [systemctl, restart, queue-worker]
+
