@@ -1,7 +1,5 @@
 # Watchdog
 
-![Watchdog Hero Banner](https://i.postimg.cc/YCBRD2hr/watchdog-hero-banner-github.jpg)
-
 A small, dependency-light Bash watchdog for websites and services. It runs
 configured health checks and executes an explicit command sequence when a
 target stays unavailable after all retry attempts.
@@ -164,6 +162,51 @@ journalctl -u service-watchdog.service
 
 The service unit treats exit code `1` as an expected watchdog result; only exit
 code `2` marks the unit failed.
+
+## cron
+
+Use root's crontab when remediation commands require access to Docker,
+`systemctl`, or other privileged services. First make the script executable and
+verify the configuration in dry-run mode:
+
+```bash
+sudo chmod +x /opt/service-watchdog/service-watchdog.sh
+sudo /opt/service-watchdog/service-watchdog.sh \
+  -c /etc/service-watchdog/config.yaml \
+  -n
+```
+
+Open root's crontab:
+
+```bash
+sudo crontab -e
+```
+
+Run the watchdog every minute:
+
+```cron
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+* * * * * /opt/service-watchdog/service-watchdog.sh -c /etc/service-watchdog/config.yaml >> /var/log/service-watchdog/cron.log 2>&1
+```
+
+For a five-minute interval, use:
+
+```cron
+*/5 * * * * /opt/service-watchdog/service-watchdog.sh -c /etc/service-watchdog/config.yaml >> /var/log/service-watchdog/cron.log 2>&1
+```
+
+Check the installation and follow the operational log:
+
+```bash
+sudo systemctl status cron
+sudo crontab -l
+sudo tail -f /var/log/service-watchdog/service-watchdog.log
+```
+
+The global `flock` lock prevents overlapping cron runs. Exit code `1` is an
+expected result when a target remains unavailable or remediation was attempted;
+cron can continue scheduling subsequent runs normally.
 
 ## Security notes
 
