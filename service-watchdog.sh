@@ -249,6 +249,77 @@ validate_email_configuration() {
     done
 }
 
+validate_webhook_configuration() {
+    local webhooks_type webhook enabled value value_type env_name env_value priority
+
+    webhooks_type="$(yaml_read '.notifications.webhooks | type')"
+    [[ "$webhooks_type" == "!!null" ]] && return 0
+    [[ "$webhooks_type" == "!!map" ]] || die "notifications.webhooks must be a YAML map."
+
+    for webhook in telegram discord slack ntfy; do
+        value_type="$(yaml_read ".notifications.webhooks.${webhook} | type")"
+        [[ "$value_type" == "!!null" ]] && continue
+        [[ "$value_type" == "!!map" ]] || die "notifications.webhooks.${webhook} must be a YAML map."
+        enabled="$(yaml_read ".notifications.webhooks.${webhook}.enabled // false")"
+        [[ "$enabled" == true || "$enabled" == false ]] ||
+            die "notifications.webhooks.${webhook}.enabled must be true or false."
+        [[ "$enabled" == true ]] || continue
+
+        for value in failure recovery; do
+            value_type="$(yaml_read ".notifications.webhooks.${webhook}.template.${value} | type")"
+            [[ "$value_type" == "!!null" ]] ||
+                validate_string ".notifications.webhooks.${webhook}.template.${value}" \
+                    "notifications.webhooks.${webhook}.template.${value}"
+        done
+
+        case "$webhook" in
+            telegram)
+                validate_string '.notifications.webhooks.telegram.bot_token_env' 'notifications.webhooks.telegram.bot_token_env'
+                validate_string '.notifications.webhooks.telegram.chat_id' 'notifications.webhooks.telegram.chat_id'
+                env_name="$(yaml_read '.notifications.webhooks.telegram.bot_token_env')"
+                value="$(yaml_read '.notifications.webhooks.telegram.chat_id')"
+                [[ "$env_name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] ||
+                    die "notifications.webhooks.telegram.bot_token_env is not a valid environment variable name."
+                [[ -n "$value" ]] || die "notifications.webhooks.telegram.chat_id must not be empty."
+                value="$(yaml_read '.notifications.webhooks.telegram.thread_id // ""')"
+                [[ -z "$value" || "$value" =~ ^[0-9]+$ ]] ||
+                    die "notifications.webhooks.telegram.thread_id must be a positive integer."
+                ;;
+            discord|slack)
+                validate_string ".notifications.webhooks.${webhook}.webhook_url_env" \
+                    "notifications.webhooks.${webhook}.webhook_url_env"
+                env_name="$(yaml_read ".notifications.webhooks.${webhook}.webhook_url_env")"
+                [[ "$env_name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] ||
+                    die "notifications.webhooks.${webhook}.webhook_url_env is not a valid environment variable name."
+                ;;
+            ntfy)
+                validate_string '.notifications.webhooks.ntfy.url' 'notifications.webhooks.ntfy.url'
+                value="$(yaml_read '.notifications.webhooks.ntfy.url')"
+                [[ "$value" =~ ^https?://[^[:space:]]+$ ]] ||
+                    die "notifications.webhooks.ntfy.url must be an HTTP(S) URL without spaces."
+                env_name="$(yaml_read '.notifications.webhooks.ntfy.token_env // ""')"
+                [[ -z "$env_name" || "$env_name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] ||
+                    die "notifications.webhooks.ntfy.token_env is not a valid environment variable name."
+                priority="$(yaml_read '.notifications.webhooks.ntfy.priority // "default"')"
+                [[ "$priority" =~ ^[1-5]$ || "$priority" =~ ^(min|low|default|high|urgent|max)$ ]] ||
+                    die "notifications.webhooks.ntfy.priority must be 1-5, min, low, default, high, urgent, or max."
+                ;;
+        esac
+
+        # Dry runs are a safe way to validate that secrets supplied outside YAML
+        # are available. Normal runs report missing values per webhook instead.
+        if (( DRY_RUN == 1 )) && [[ -n "$env_name" ]]; then
+            env_value="${!env_name:-}"
+            [[ -n "$env_value" ]] ||
+                die "notifications.webhooks.${webhook}: environment variable is empty or undefined: ${env_name}"
+            if [[ "$webhook" == discord || "$webhook" == slack ]]; then
+                [[ "$env_value" =~ ^https?://[^[:space:]]+$ ]] ||
+                    die "notifications.webhooks.${webhook}: URL in ${env_name} must be an HTTP(S) URL without spaces."
+            fi
+        fi
+    done
+}
+
 validate_configuration() {
     local services_type service_count index name enabled check_type value value_type
     local status_count status_index status_code port actions_type hooks_type hook_name
@@ -361,6 +432,7 @@ validate_configuration() {
     fi
 
     validate_email_configuration
+    validate_webhook_configuration
 }
 
 configure_runtime() {
@@ -480,6 +552,145 @@ render_email_template() {
     template="${template//\{\{check_exit\}\}/${CHECK_EXIT_CODE:-n/a}}"
     template="${template//\{\{action_status\}\}/$CURRENT_ACTION_STATUS}"
     printf '%s' "$template"
+}
+
+escape_html() {
+    local value="$1"
+    value="${value//&/\&amp;}"
+    value="${value//</\&lt;}"
+    value="${value//>/\&gt;}"
+    printf '%s' "$value"
+}
+
+escape_json() {
+    local value="$1"
+    value="${value//\\/\\\\}"
+    value="${value//\"/\\\"}"
+    value="${value//$'\t'/\\t}"
+    printf '%s' "$value"
+}
+
+render_webhook_template() {
+    local format="$1" template="$2" event="$3" timestamp="$4"
+    local service detail check_type http_status check_exit action_status
+
+    service="$CURRENT_SERVICE"
+    detail="$(sanitize_detail "$CHECK_DETAIL")"
+    check_type="$CURRENT_CHECK_TYPE"
+    http_status="${CHECK_HTTP_STATUS:-n/a}"
+    check_exit="${CHECK_EXIT_CODE:-n/a}"
+    action_status="$CURRENT_ACTION_STATUS"
+    case "$format" in
+        html)
+            service="$(escape_html "$service")"; detail="$(escape_html "$detail")"
+            check_type="$(escape_html "$check_type")"; http_status="$(escape_html "$http_status")"
+            check_exit="$(escape_html "$check_exit")"; action_status="$(escape_html "$action_status")"
+            ;;
+        json)
+            service="$(escape_json "$service")"; detail="$(escape_json "$detail")"
+            check_type="$(escape_json "$check_type")"; http_status="$(escape_json "$http_status")"
+            check_exit="$(escape_json "$check_exit")"; action_status="$(escape_json "$action_status")"
+            ;;
+    esac
+    template="${template//\{\{service\}\}/$service}"
+    template="${template//\{\{event\}\}/$event}"
+    template="${template//\{\{timestamp\}\}/$timestamp}"
+    template="${template//\{\{check_type\}\}/$check_type}"
+    template="${template//\{\{detail\}\}/$detail}"
+    template="${template//\{\{http_status\}\}/$http_status}"
+    template="${template//\{\{check_exit\}\}/$check_exit}"
+    template="${template//\{\{action_status\}\}/$action_status}"
+    printf '%s' "$template"
+}
+
+webhook_template() {
+    local webhook="$1" event="$2" fallback value value_type
+    case "${webhook}:${event}" in
+        telegram:failure) fallback=$'🚨 <b>{{service}}</b> DOWN\n\nType: {{check_type}}\nDetail: {{detail}}\nTime: {{timestamp}}' ;;
+        telegram:recovery) fallback=$'✅ <b>{{service}}</b> UP\n\nRecovered at {{timestamp}}' ;;
+        discord:failure) fallback='{"content":"🚨 **{{service}}** is unavailable: {{detail}}"}' ;;
+        discord:recovery) fallback='{"content":"✅ **{{service}}** recovered"}' ;;
+        slack:failure) fallback='{"text":"🚨 {{service}} DOWN: {{detail}}"}' ;;
+        slack:recovery) fallback='{"text":"✅ {{service}} recovered"}' ;;
+        ntfy:failure) fallback='🚨 {{service}} unavailable: {{detail}}' ;;
+        ntfy:recovery) fallback='✅ {{service}} recovered' ;;
+        *) return 1 ;;
+    esac
+    value_type="$(yaml_read ".notifications.webhooks.${webhook}.template.${event} | type")"
+    if [[ "$value_type" == "!!null" ]]; then
+        value="$fallback"
+    else
+        value="$(yaml_read ".notifications.webhooks.${webhook}.template.${event}")"
+    fi
+    printf '%s' "$value"
+}
+
+send_single_webhook() {
+    local webhook="$1" event="$2" env_name="" secret="" url="" template text timestamp
+    local response_file response http_status curl_status thread_id priority
+    local -a curl_command
+
+    case "$webhook" in
+        telegram) env_name="$(yaml_read '.notifications.webhooks.telegram.bot_token_env')" ;;
+        discord|slack) env_name="$(yaml_read ".notifications.webhooks.${webhook}.webhook_url_env")" ;;
+        ntfy) env_name="$(yaml_read '.notifications.webhooks.ntfy.token_env // ""')" ;;
+    esac
+    if [[ -n "$env_name" ]]; then
+        secret="${!env_name:-}"
+        if [[ -z "$secret" ]]; then
+            log ERROR "service=${CURRENT_SERVICE} webhook=${webhook} result=webhook-failed reason=missing-env:${env_name} event=${event}"
+            return 1
+        fi
+    fi
+
+    timestamp="$(date '+%Y-%m-%d %H:%M:%S%z')"
+    template="$(webhook_template "$webhook" "$event")" || return 1
+    response_file="${TEMP_DIRECTORY}/webhook-${webhook}-${RANDOM}.response"
+    curl_command=(curl --silent --show-error --output "$response_file" --write-out '%{http_code}' --connect-timeout 10 --max-time 30)
+    case "$webhook" in
+        telegram)
+            text="$(render_webhook_template html "$template" "$event" "$timestamp")"
+            url="https://api.telegram.org/bot${secret}/sendMessage"
+            thread_id="$(yaml_read '.notifications.webhooks.telegram.thread_id // ""')"
+            curl_command+=(--request POST --data-urlencode "chat_id=$(yaml_read '.notifications.webhooks.telegram.chat_id')" --data-urlencode "text=${text}" --data-urlencode 'parse_mode=HTML')
+            [[ -z "$thread_id" ]] || curl_command+=(--data-urlencode "message_thread_id=${thread_id}")
+            ;;
+        discord|slack)
+            text="$(render_webhook_template json "$template" "$event" "$timestamp")"
+            url="$secret"
+            curl_command+=(--request POST --header 'Content-Type: application/json' --data "$text")
+            ;;
+        ntfy)
+            text="$(render_webhook_template plain "$template" "$event" "$timestamp")"
+            url="$(yaml_read '.notifications.webhooks.ntfy.url')"
+            priority="$(yaml_read '.notifications.webhooks.ntfy.priority // "default"')"
+            curl_command+=(--request POST --header 'Title: watchdog' --header "Priority: ${priority}" --data-binary "$text")
+            [[ -z "$secret" ]] || curl_command+=(--header "Authorization: Bearer ${secret}")
+            ;;
+    esac
+
+    http_status="$("${curl_command[@]}" "$url" 2>/dev/null)"
+    curl_status=$?
+    response=""; [[ -s "$response_file" ]] && response="$(<"$response_file")"
+    rm -f -- "$response_file"
+    if (( curl_status == 0 )) && [[ "$http_status" =~ ^2[0-9][0-9]$ ]]; then
+        if [[ "$webhook" != telegram || "$response" =~ \"ok\"[[:space:]]*:[[:space:]]*true ]]; then
+            log INFO "service=${CURRENT_SERVICE} webhook=${webhook} result=webhook-sent event=${event} http_status=${http_status}"
+            return 0
+        fi
+    fi
+    log ERROR "service=${CURRENT_SERVICE} webhook=${webhook} result=webhook-failed event=${event} curl_exit=${curl_status} http_status=${http_status:-000}"
+    return 1
+}
+
+send_webhook_notification() {
+    local event="$1" webhook enabled failed=0
+    for webhook in telegram discord slack ntfy; do
+        enabled="$(yaml_read ".notifications.webhooks.${webhook}.enabled // false")"
+        [[ "$enabled" == true ]] || continue
+        send_single_webhook "$webhook" "$event" || failed=1
+    done
+    return "$failed"
 }
 
 send_email_notification() {
@@ -777,6 +988,8 @@ handle_state_transition() {
     if [[ -n "$notification_event" ]]; then
         send_email_notification "$notification_event" ||
             log ERROR "service=${service_name} result=state-email-failed state=${new_state}"
+        send_webhook_notification "$notification_event" ||
+            log ERROR "service=${service_name} result=state-webhook-failed state=${new_state}"
     fi
     if [[ -n "$hook_expression" ]]; then
         run_configured_sequence "$hook_expression" "${new_state}" "$service_name" ||

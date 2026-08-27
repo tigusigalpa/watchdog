@@ -12,6 +12,7 @@ service names, and commands before enabling scheduled runs.
 | [`multiple-services.yaml`](multiple-services.yaml) | Monitor HTTP, TCP, and systemd services in one run |
 | [`hooks.yaml`](hooks.yaml) | Run notification hooks on failure and recovery transitions |
 | [`smtp-email.yaml`](smtp-email.yaml) | Send built-in SMTP email on failure and recovery transitions |
+| [`telegram-notifications.yaml`](telegram-notifications.yaml) | Send Telegram transition notifications with a bot token from the environment |
 
 Test a configuration without executing remediation commands or changing state:
 

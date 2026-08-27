@@ -1,0 +1,12 @@
+# Copy the settings and services appropriate for your installation, then set
+# WATCHDOG_TG_BOT_TOKEN in the systemd environment file or scheduler.
+notifications:
+  webhooks:
+    telegram:
+      enabled: true
+      bot_token_env: WATCHDOG_TG_BOT_TOKEN
+      chat_id: "-1001234567890"
+      # thread_id: "42"
+      template:
+        failure: "🚨 <b>{{service}}</b> недоступен\n\nПроверка: {{check_type}}\nДетали: {{detail}}\nВремя: {{timestamp}}"
+        recovery: "✅ <b>{{service}}</b> снова доступен\n\nВремя: {{timestamp}}"

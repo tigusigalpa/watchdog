@@ -24,6 +24,7 @@ cron, or another scheduler.
 - Optional health verification after remediation
 - Failure and recovery hooks with environment variables
 - Built-in SMTP email alerts with YAML-configured templates and recipients
+- Telegram, Discord, Slack, and ntfy webhook alerts
 - Persistent state and transition-only hooks
 - Global non-blocking lock to prevent overlapping runs
 - Dry-run and single-service modes
@@ -343,6 +344,66 @@ so the watchdog does not flood recipients with repeated attempts. A successful
 SMTP request is written to the operational log as `result=email-sent`; a failed
 request is written as `result=email-failed`.
 
+### Webhook notifications
+
+Webhooks are sent on the same transitions as email: once when a service becomes
+unavailable and once when it later recovers. They are not sent for repeated
+failed checks. All secrets are read from environment variables at delivery time;
+do not put a bot token, webhook URL, or ntfy token in YAML.
+
+```yaml
+notifications:
+  webhooks:
+    telegram:
+      enabled: true
+      bot_token_env: WATCHDOG_TG_BOT_TOKEN
+      chat_id: "-1001234567890"
+      # thread_id: "42"  # optional forum topic
+      template:
+        failure: "🚨 <b>{{service}}</b> DOWN\n\nDetail: {{detail}}\nTime: {{timestamp}}"
+        recovery: "✅ <b>{{service}}</b> recovered at {{timestamp}}"
+
+    discord:
+      enabled: true
+      webhook_url_env: WATCHDOG_DISCORD_WEBHOOK_URL
+      template:
+        failure: '{"content":"🚨 **{{service}}** is unavailable: {{detail}}"}'
+        recovery: '{"content":"✅ **{{service}}** recovered"}'
+
+    slack:
+      enabled: true
+      webhook_url_env: WATCHDOG_SLACK_WEBHOOK_URL
+      template:
+        failure: '{"text":"🚨 {{service}} DOWN: {{detail}}"}'
+        recovery: '{"text":"✅ {{service}} recovered"}'
+
+    ntfy:
+      enabled: true
+      url: https://ntfy.sh/watchdog-alerts
+      token_env: WATCHDOG_NTFY_TOKEN  # optional
+      priority: urgent
+      template:
+        failure: "🚨 {{service}} unavailable: {{detail}}"
+        recovery: "✅ {{service}} recovered"
+```
+
+Telegram uses HTML parse mode, so use HTML tags such as `<b>...</b>` for
+formatting. Discord and Slack templates must be valid JSON payloads; dynamic
+template values are JSON-escaped before delivery. ntfy sends the rendered text
+as the request body with `Title: watchdog` and the configured priority.
+
+Supported variables are the same as email templates: `{{service}}`, `{{event}}`,
+`{{timestamp}}`, `{{check_type}}`, `{{detail}}`, `{{http_status}}`,
+`{{check_exit}}`, and `{{action_status}}`.
+
+Run `service-watchdog.sh -n` after setting the relevant environment variables:
+dry-run validates enabled webhook configuration and that each configured secret
+or webhook URL environment variable is non-empty. At delivery time a missing
+variable is logged as `result=webhook-failed` with its variable name, never its
+value. Webhook URLs and tokens are not written to the operational log. See
+[`examples/telegram-notifications.yaml`](examples/telegram-notifications.yaml)
+for a Telegram-only starting point.
+
 ### Hooks and integrations
 
 `hooks.on_failure` and `hooks.on_recovery` run only on state transitions. Use
@@ -513,10 +574,11 @@ configured timeout before increasing the schedule interval.
 
 ```bash
 bash -n service-watchdog.sh install.sh tests/smoke.sh
-bash -n tests/email-notifications.sh
-shellcheck service-watchdog.sh install.sh tests/smoke.sh tests/email-notifications.sh
+bash -n tests/email-notifications.sh tests/webhooks.sh
+shellcheck service-watchdog.sh install.sh tests/smoke.sh tests/email-notifications.sh tests/webhooks.sh
 bash ./tests/smoke.sh
 bash ./tests/email-notifications.sh
+bash ./tests/webhooks.sh
 ```
 
 The smoke test starts a local HTTP server and verifies both the healthy path and

@@ -53,6 +53,41 @@ notifications:
         Detail: {{detail}}
         Remediation: {{action_status}}
 
+  # Webhooks are also transition-based. Keep tokens and webhook URLs in the
+  # environment, never in this file. Each provider may be enabled separately.
+  webhooks:
+    telegram:
+      enabled: false
+      bot_token_env: WATCHDOG_TG_BOT_TOKEN
+      chat_id: "-1001234567890"
+      # thread_id: "42"  # Optional Telegram forum topic.
+      template:
+        failure: "🚨 <b>{{service}}</b> DOWN\n\nType: {{check_type}}\nDetail: {{detail}}\nTime: {{timestamp}}"
+        recovery: "✅ <b>{{service}}</b> UP\n\nRecovered at {{timestamp}}"
+
+    discord:
+      enabled: false
+      webhook_url_env: WATCHDOG_DISCORD_WEBHOOK_URL
+      template:
+        failure: '{"content":"🚨 **{{service}}** is unavailable: {{detail}}"}'
+        recovery: '{"content":"✅ **{{service}}** recovered"}'
+
+    slack:
+      enabled: false
+      webhook_url_env: WATCHDOG_SLACK_WEBHOOK_URL
+      template:
+        failure: '{"text":"🚨 {{service}} DOWN: {{detail}}"}'
+        recovery: '{"text":"✅ {{service}} recovered"}'
+
+    ntfy:
+      enabled: false
+      url: https://ntfy.sh/watchdog-alerts
+      token_env: WATCHDOG_NTFY_TOKEN  # Optional; remove for public topics.
+      priority: urgent
+      template:
+        failure: "🚨 {{service}} unavailable: {{detail}}"
+        recovery: "✅ {{service}} recovered"
+
 # Optional commands invoked only when a service changes state. Every command
 # receives WATCHDOG_SERVICE, WATCHDOG_EVENT, WATCHDOG_DETAIL,
 # WATCHDOG_CHECK_TYPE, WATCHDOG_HTTP_STATUS, and WATCHDOG_CHECK_EXIT.
