@@ -404,6 +404,40 @@ value. Webhook URLs and tokens are not written to the operational log. See
 [`examples/telegram-notifications.yaml`](examples/telegram-notifications.yaml)
 for a Telegram-only starting point.
 
+### Maintenance Windows
+
+Maintenance windows keep health checks and persistent state updates active, but
+suppress remediation commands, email, webhooks, and state-change hooks. Define
+them per service using IANA time zones (or omit `timezone` to use the system
+time zone):
+
+```yaml
+services:
+  - name: api
+    # check and actions omitted
+    maintenance:
+      timezone: Europe/Moscow
+      windows:
+        - name: nightly-backup
+          days: "Sun,Wed"
+          time: "02:00-04:00"
+        - name: weekend-deploy
+          days: "Sat,Sun"
+          time: "00:00-06:00"
+```
+
+`days` accepts `Mon` through `Sun` (case-insensitive), comma-separated, or `*`
+for every day. `time` is a half-open 24-hour interval: the start is included
+and the end is excluded. Windows may not cross midnight, so `22:00-02:00` is
+invalid; use two same-day windows instead.
+
+If a service first becomes unavailable during a maintenance window and remains
+unavailable afterwards, Watchdog sends one deferred failure notification and
+runs the failure hook on the first check after the window ends. A service that
+recovers during the window does not generate a recovery notification. Existing
+outages keep their state throughout a window and do not receive duplicate
+failure alerts afterwards.
+
 ### Hooks and integrations
 
 `hooks.on_failure` and `hooks.on_recovery` run only on state transitions. Use
@@ -574,11 +608,12 @@ configured timeout before increasing the schedule interval.
 
 ```bash
 bash -n service-watchdog.sh install.sh tests/smoke.sh
-bash -n tests/email-notifications.sh tests/webhooks.sh
-shellcheck service-watchdog.sh install.sh tests/smoke.sh tests/email-notifications.sh tests/webhooks.sh
+bash -n tests/email-notifications.sh tests/webhooks.sh tests/maintenance.sh
+shellcheck service-watchdog.sh install.sh tests/smoke.sh tests/email-notifications.sh tests/webhooks.sh tests/maintenance.sh
 bash ./tests/smoke.sh
 bash ./tests/email-notifications.sh
 bash ./tests/webhooks.sh
+bash ./tests/maintenance.sh
 ```
 
 The smoke test starts a local HTTP server and verifies both the healthy path and

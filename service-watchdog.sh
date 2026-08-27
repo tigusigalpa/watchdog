@@ -31,6 +31,8 @@ CHECK_EXIT_CODE=""
 CURRENT_SERVICE=""
 CURRENT_CHECK_TYPE=""
 CURRENT_ACTION_STATUS="not-attempted"
+MAINTENANCE_ACTIVE=0
+MAINTENANCE_WINDOW_NAME=""
 
 EMAIL_ENABLED=0
 EMAIL_SMTP_URL=""
@@ -320,6 +322,50 @@ validate_webhook_configuration() {
     done
 }
 
+validate_maintenance_configuration() {
+    local index="$1" service_name="$2" maintenance_type timezone windows_type count window
+    local days time start end day normalized_day
+
+    maintenance_type="$(yaml_read ".services[$index].maintenance | type")"
+    [[ "$maintenance_type" == "!!null" ]] && return 0
+    [[ "$maintenance_type" == "!!map" ]] || die "Service '${service_name}': maintenance must be a YAML map."
+    timezone="$(yaml_read ".services[$index].maintenance.timezone // \"\"")"
+    if [[ -n "$timezone" ]]; then
+        [[ "$timezone" != *[[:space:]]* ]] || die "Service '${service_name}': maintenance.timezone must not contain spaces."
+        TZ="$timezone" date '+%H:%M' >/dev/null 2>&1 ||
+            die "Service '${service_name}': maintenance.timezone is invalid: ${timezone}"
+        [[ "$timezone" == UTC || -r "/usr/share/zoneinfo/${timezone}" ]] ||
+            die "Service '${service_name}': maintenance.timezone is not an installed IANA time zone: ${timezone}"
+    fi
+    windows_type="$(yaml_read ".services[$index].maintenance.windows | type")"
+    [[ "$windows_type" == "!!seq" ]] || die "Service '${service_name}': maintenance.windows must be a YAML array."
+    count="$(yaml_read ".services[$index].maintenance.windows | length")"
+    for ((window = 0; window < count; window++)); do
+        validate_string ".services[$index].maintenance.windows[$window].days" \
+            "Service '${service_name}': maintenance.windows[$window].days"
+        validate_string ".services[$index].maintenance.windows[$window].time" \
+            "Service '${service_name}': maintenance.windows[$window].time"
+        days="$(yaml_read ".services[$index].maintenance.windows[$window].days")"
+        time="$(yaml_read ".services[$index].maintenance.windows[$window].time")"
+        [[ "$time" =~ ^[0-9]{2}:[0-9]{2}-[0-9]{2}:[0-9]{2}$ ]] ||
+            die "Service '${service_name}': maintenance.windows[$window].time must use HH:MM-HH:MM."
+        start="${time%-*}"; end="${time#*-}"
+        [[ "${start%:*}" =~ ^(0[0-9]|1[0-9]|2[0-3])$ && "${start#*:}" =~ ^[0-5][0-9]$ &&
+           "${end%:*}" =~ ^(0[0-9]|1[0-9]|2[0-3])$ && "${end#*:}" =~ ^[0-5][0-9]$ &&
+           "$start" < "$end" ]] ||
+            die "Service '${service_name}': maintenance.windows[$window].time must be a same-day interval with start before end."
+        [[ -n "$days" ]] || die "Service '${service_name}': maintenance.windows[$window].days must not be empty."
+        [[ "$days" == "*" ]] && continue
+        IFS=',' read -r -a day_list <<<"$days"
+        for day in "${day_list[@]}"; do
+            normalized_day="${day,,}"
+            case "$normalized_day" in mon|tue|wed|thu|fri|sat|sun) ;; *)
+                die "Service '${service_name}': invalid maintenance day '${day}'." ;;
+            esac
+        done
+    done
+}
+
 validate_configuration() {
     local services_type service_count index name enabled check_type value value_type
     local status_count status_index status_code port actions_type hooks_type hook_name
@@ -418,6 +464,7 @@ validate_configuration() {
         value="$(yaml_read ".services[$index].actions.verify_after // 0")"
         is_non_negative_integer "$value" ||
             die "Service '${name}': actions.verify_after must be a non-negative integer."
+        validate_maintenance_configuration "$index" "$name"
     done
 
     hooks_type="$(yaml_read '.hooks | type')"
@@ -970,12 +1017,115 @@ record_action_attempt() {
     mv -f -- "$temporary" "$file" || die "Cannot update action state: ${file}"
 }
 
+maintenance_marker_file() {
+    local service_name="$1" marker="$2"
+    printf '%s/%s.%s' "$STATE_DIRECTORY" "$service_name" "$marker"
+}
+
+is_maintenance_window() {
+    local service_name="$1" service_count index name timezone day now days time start end window_count window
+    local matched_day normalized_day
+
+    MAINTENANCE_WINDOW_NAME=""
+    service_count="$(yaml_read '.services | length')"
+    for ((index = 0; index < service_count; index++)); do
+        name="$(yaml_read ".services[$index].name")"
+        [[ "$name" == "$service_name" ]] && break
+    done
+    (( index < service_count )) || return 1
+    window_count="$(yaml_read ".services[$index].maintenance.windows // [] | length")"
+    (( window_count > 0 )) || return 1
+    timezone="$(yaml_read ".services[$index].maintenance.timezone // \"\"")"
+    if [[ -n "$timezone" ]]; then
+        day="$(TZ="$timezone" LC_ALL=C date '+%a')"
+        now="$(TZ="$timezone" date '+%H:%M')"
+    else
+        day="$(LC_ALL=C date '+%a')"
+        now="$(date '+%H:%M')"
+    fi
+    day="${day,,}"
+    for ((window = 0; window < window_count; window++)); do
+        days="$(yaml_read ".services[$index].maintenance.windows[$window].days")"
+        time="$(yaml_read ".services[$index].maintenance.windows[$window].time")"
+        matched_day=0
+        if [[ "$days" == "*" ]]; then
+            matched_day=1
+        else
+            IFS=',' read -r -a maintenance_days <<<"$days"
+            for normalized_day in "${maintenance_days[@]}"; do
+                [[ "${normalized_day,,}" == "$day" ]] && matched_day=1
+            done
+        fi
+        start="${time%-*}"; end="${time#*-}"
+        if (( matched_day == 1 )) && [[ "$now" > "$start" || "$now" == "$start" ]] && [[ "$now" < "$end" ]]; then
+            MAINTENANCE_WINDOW_NAME="$(yaml_read ".services[$index].maintenance.windows[$window].name // \"window-${window}\"")"
+            return 0
+        fi
+    done
+    return 1
+}
+
+update_maintenance_status() {
+    local service_name="$1" active_file
+    MAINTENANCE_ACTIVE=0
+    if ! is_maintenance_window "$service_name"; then
+        record_maintenance_exit "$service_name"
+        return 0
+    fi
+    MAINTENANCE_ACTIVE=1
+    (( DRY_RUN == 0 )) || return 0
+    active_file="$(maintenance_marker_file "$service_name" maintenance-active)"
+    if [[ ! -e "$active_file" ]]; then
+        printf '%s\n' "$MAINTENANCE_WINDOW_NAME" >"$active_file" || die "Cannot write maintenance state: ${active_file}"
+        log INFO "service=${service_name} maintenance_window=${MAINTENANCE_WINDOW_NAME} active=true"
+    fi
+}
+
+record_maintenance_exit() {
+    local service_name="$1" active_file previous_window="previous"
+    (( DRY_RUN == 0 )) || return 0
+    active_file="$(maintenance_marker_file "$service_name" maintenance-active)"
+    if [[ -e "$active_file" ]]; then
+        [[ -s "$active_file" ]] && IFS= read -r previous_window <"$active_file" || true
+        rm -f -- "$active_file"
+        log INFO "service=${service_name} maintenance_window=${previous_window} active=false"
+    fi
+}
+
+send_deferred_failure_alert() {
+    local service_name="$1" deferred_file
+    (( DRY_RUN == 0 && MAINTENANCE_ACTIVE == 0 )) || return 0
+    deferred_file="$(maintenance_marker_file "$service_name" maintenance-deferred-failure)"
+    [[ -e "$deferred_file" ]] || return 0
+    [[ "$(read_state "$service_name")" == unavailable ]] || { rm -f -- "$deferred_file"; return 0; }
+    log WARN "service=${service_name} state=unavailable maintenance=deferred_alert action=send"
+    send_email_notification failure || log ERROR "service=${service_name} result=state-email-failed state=unavailable"
+    send_webhook_notification failure || log ERROR "service=${service_name} result=state-webhook-failed state=unavailable"
+    run_configured_sequence '.hooks.on_failure' unavailable "$service_name" ||
+        log ERROR "service=${service_name} result=state-hook-failed state=unavailable"
+    rm -f -- "$deferred_file"
+}
+
 handle_state_transition() {
     local service_name="$1" new_state="$2"
-    local previous hook_expression notification_event
+    local previous hook_expression notification_event deferred_file
     (( DRY_RUN == 0 )) || return 0
     previous="$(read_state "$service_name")"
-    [[ "$previous" != "$new_state" ]] || return 0
+    if [[ "$previous" == "$new_state" ]]; then
+        [[ "$new_state" == unavailable ]] && send_deferred_failure_alert "$service_name"
+        return 0
+    fi
+    if (( MAINTENANCE_ACTIVE == 1 )); then
+        deferred_file="$(maintenance_marker_file "$service_name" maintenance-deferred-failure)"
+        if [[ "$new_state" == unavailable ]]; then
+            : >"$deferred_file" || die "Cannot write maintenance state: ${deferred_file}"
+        else
+            rm -f -- "$deferred_file"
+        fi
+        write_state "$service_name" "$new_state"
+        log INFO "service=${service_name} event=state-change state=${new_state} maintenance_window=${MAINTENANCE_WINDOW_NAME} action=suppressed"
+        return 0
+    fi
     hook_expression=""
     notification_event=""
     if [[ "$new_state" == unavailable ]]; then
@@ -1019,16 +1169,20 @@ process_service() {
     log INFO "service=${CURRENT_SERVICE} action=service-start type=${CURRENT_CHECK_TYPE}"
     if check_with_retries "$index"; then
         CURRENT_ACTION_STATUS="not-required"
+        update_maintenance_status "$CURRENT_SERVICE"
         handle_state_transition "$CURRENT_SERVICE" healthy
         log INFO "service=${CURRENT_SERVICE} result=healthy"
         return 0
     fi
 
+    update_maintenance_status "$CURRENT_SERVICE"
     actions_count="$(yaml_read ".services[$index].actions.commands // [] | length")"
     if (( actions_count == 0 )); then
         CURRENT_ACTION_STATUS="not-configured"
     elif (( DRY_RUN == 1 )); then
         CURRENT_ACTION_STATUS="skipped-dry-run"
+    elif (( MAINTENANCE_ACTIVE == 1 )); then
+        CURRENT_ACTION_STATUS="skipped-maintenance"
     elif action_is_due "$index" "$CURRENT_SERVICE"; then
         CURRENT_ACTION_STATUS="pending"
         action_due=1
@@ -1043,6 +1197,8 @@ process_service() {
     if (( actions_count > 0 )); then
         if (( DRY_RUN == 1 )); then
             log WARN "service=${CURRENT_SERVICE} action=remediation result=skipped reason=dry-run"
+        elif (( MAINTENANCE_ACTIVE == 1 )); then
+            log WARN "service=${CURRENT_SERVICE} action=remediation result=skipped reason=maintenance-window maintenance_window=${MAINTENANCE_WINDOW_NAME}"
         elif (( action_due == 1 )); then
             ACTION_ATTEMPTED=1
             record_action_attempt "$CURRENT_SERVICE"
@@ -1057,6 +1213,7 @@ process_service() {
             (( verify_after > 0 )) && sleep "$verify_after"
             if check_with_retries "$index"; then
                 CURRENT_ACTION_STATUS="successful"
+                update_maintenance_status "$CURRENT_SERVICE"
                 handle_state_transition "$CURRENT_SERVICE" healthy
                 log WARN "service=${CURRENT_SERVICE} result=recovered-after-remediation"
                 return 0

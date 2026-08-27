@@ -120,6 +120,18 @@ services:
           working_directory: /srv/example
           timeout: 120
 
+    # Checks continue during these periods, while remediation, email, webhooks,
+    # and hooks are suppressed. Windows must start and end on the same day.
+    maintenance:
+      timezone: Europe/Moscow
+      windows:
+        - name: nightly-backup
+          days: "Sun,Wed"
+          time: "02:00-04:00"
+        - name: weekend-deploy
+          days: "Sat,Sun"
+          time: "00:00-06:00"
+
   - name: local-postgresql
     check:
       type: tcp
