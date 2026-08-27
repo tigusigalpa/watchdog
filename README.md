@@ -438,6 +438,44 @@ recovers during the window does not generate a recovery notification. Existing
 outages keep their state throughout a window and do not receive duplicate
 failure alerts afterwards.
 
+### Escalation
+
+Escalation adds a higher-level response when a service remains unavailable for
+several consecutive watchdog runs. The counter is incremented once per
+unavailable run, including runs where ordinary remediation is in cooldown. It
+resets when the service becomes healthy.
+
+```yaml
+services:
+  - name: api
+    # check and actions omitted
+    escalation:
+      enabled: true
+      after_consecutive_unavailable: 3
+      cooldown: 3600
+      notify: true
+      actions:
+        commands:
+          - command: [systemctl, restart, docker]
+            timeout: 60
+      hooks:
+        on_escalation:
+          - command: [/usr/local/bin/page-oncall]
+            timeout: 30
+```
+
+Once the threshold is reached and the service is still unavailable after its
+ordinary actions (or after the current check when no action runs), Watchdog
+runs the escalation commands, sends an `[ESCALATION]` email and escalation
+webhooks to all enabled notification channels, then runs `on_escalation` hooks.
+Failures in escalation commands do not prevent notifications or hooks from
+running. `cooldown: 0` allows an escalation on every subsequent unavailable
+run after the threshold; a positive cooldown limits repeated escalation.
+
+Escalation is suppressed during a maintenance window. Watchdog persists the
+counter, escalation count, and last escalation timestamp in sidecar files next
+to its existing state file, preserving compatibility with existing state files.
+
 ### Hooks and integrations
 
 `hooks.on_failure` and `hooks.on_recovery` run only on state transitions. Use
@@ -608,12 +646,13 @@ configured timeout before increasing the schedule interval.
 
 ```bash
 bash -n service-watchdog.sh install.sh tests/smoke.sh
-bash -n tests/email-notifications.sh tests/webhooks.sh tests/maintenance.sh
-shellcheck service-watchdog.sh install.sh tests/smoke.sh tests/email-notifications.sh tests/webhooks.sh tests/maintenance.sh
+bash -n tests/email-notifications.sh tests/webhooks.sh tests/maintenance.sh tests/escalation.sh
+shellcheck service-watchdog.sh install.sh tests/smoke.sh tests/email-notifications.sh tests/webhooks.sh tests/maintenance.sh tests/escalation.sh
 bash ./tests/smoke.sh
 bash ./tests/email-notifications.sh
 bash ./tests/webhooks.sh
 bash ./tests/maintenance.sh
+bash ./tests/escalation.sh
 ```
 
 The smoke test starts a local HTTP server and verifies both the healthy path and

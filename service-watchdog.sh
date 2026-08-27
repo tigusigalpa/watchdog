@@ -33,6 +33,8 @@ CURRENT_CHECK_TYPE=""
 CURRENT_ACTION_STATUS="not-attempted"
 MAINTENANCE_ACTIVE=0
 MAINTENANCE_WINDOW_NAME=""
+ESCALATION_CONSECUTIVE_UNAVAILABLE=0
+ESCALATION_COUNT=0
 
 EMAIL_ENABLED=0
 EMAIL_SMTP_URL=""
@@ -267,7 +269,7 @@ validate_webhook_configuration() {
             die "notifications.webhooks.${webhook}.enabled must be true or false."
         [[ "$enabled" == true ]] || continue
 
-        for value in failure recovery; do
+        for value in failure recovery escalation; do
             value_type="$(yaml_read ".notifications.webhooks.${webhook}.template.${value} | type")"
             [[ "$value_type" == "!!null" ]] ||
                 validate_string ".notifications.webhooks.${webhook}.template.${value}" \
@@ -364,6 +366,36 @@ validate_maintenance_configuration() {
             esac
         done
     done
+}
+
+validate_escalation_configuration() {
+    local index="$1" service_name="$2" escalation_type enabled value value_type hooks_type
+
+    escalation_type="$(yaml_read ".services[$index].escalation | type")"
+    [[ "$escalation_type" == "!!null" ]] && return 0
+    [[ "$escalation_type" == "!!map" ]] || die "Service '${service_name}': escalation must be a YAML map."
+    enabled="$(yaml_read ".services[$index].escalation.enabled // false")"
+    [[ "$enabled" == true || "$enabled" == false ]] ||
+        die "Service '${service_name}': escalation.enabled must be true or false."
+    [[ "$enabled" == true ]] || return 0
+    value="$(yaml_read ".services[$index].escalation.after_consecutive_unavailable")"
+    is_positive_integer "$value" ||
+        die "Service '${service_name}': escalation.after_consecutive_unavailable must be a positive integer."
+    value="$(yaml_read ".services[$index].escalation.cooldown // 0")"
+    is_non_negative_integer "$value" || die "Service '${service_name}': escalation.cooldown must be non-negative."
+    value="$(yaml_read ".services[$index].escalation.notify // true")"
+    [[ "$value" == true || "$value" == false ]] ||
+        die "Service '${service_name}': escalation.notify must be true or false."
+    value_type="$(yaml_read ".services[$index].escalation.actions.commands | type")"
+    if [[ "$value_type" != "!!null" ]]; then
+        validate_command_sequence ".services[$index].escalation.actions.commands" \
+            "Service '${service_name}': escalation.actions.commands" true
+    fi
+    hooks_type="$(yaml_read ".services[$index].escalation.hooks.on_escalation | type")"
+    if [[ "$hooks_type" != "!!null" ]]; then
+        validate_command_sequence ".services[$index].escalation.hooks.on_escalation" \
+            "Service '${service_name}': escalation.hooks.on_escalation" true
+    fi
 }
 
 validate_configuration() {
@@ -465,6 +497,7 @@ validate_configuration() {
         is_non_negative_integer "$value" ||
             die "Service '${name}': actions.verify_after must be a non-negative integer."
         validate_maintenance_configuration "$index" "$name"
+        validate_escalation_configuration "$index" "$name"
     done
 
     hooks_type="$(yaml_read '.hooks | type')"
@@ -598,6 +631,8 @@ render_email_template() {
     template="${template//\{\{http_status\}\}/${CHECK_HTTP_STATUS:-n/a}}"
     template="${template//\{\{check_exit\}\}/${CHECK_EXIT_CODE:-n/a}}"
     template="${template//\{\{action_status\}\}/$CURRENT_ACTION_STATUS}"
+    template="${template//\{\{consecutive_unavailable\}\}/$ESCALATION_CONSECUTIVE_UNAVAILABLE}"
+    template="${template//\{\{escalation_count\}\}/$ESCALATION_COUNT}"
     printf '%s' "$template"
 }
 
@@ -619,7 +654,7 @@ escape_json() {
 
 render_webhook_template() {
     local format="$1" template="$2" event="$3" timestamp="$4"
-    local service detail check_type http_status check_exit action_status
+    local service detail check_type http_status check_exit action_status consecutive_unavailable escalation_count
 
     service="$CURRENT_SERVICE"
     detail="$(sanitize_detail "$CHECK_DETAIL")"
@@ -627,6 +662,8 @@ render_webhook_template() {
     http_status="${CHECK_HTTP_STATUS:-n/a}"
     check_exit="${CHECK_EXIT_CODE:-n/a}"
     action_status="$CURRENT_ACTION_STATUS"
+    consecutive_unavailable="$ESCALATION_CONSECUTIVE_UNAVAILABLE"
+    escalation_count="$ESCALATION_COUNT"
     case "$format" in
         html)
             service="$(escape_html "$service")"; detail="$(escape_html "$detail")"
@@ -647,6 +684,8 @@ render_webhook_template() {
     template="${template//\{\{http_status\}\}/$http_status}"
     template="${template//\{\{check_exit\}\}/$check_exit}"
     template="${template//\{\{action_status\}\}/$action_status}"
+    template="${template//\{\{consecutive_unavailable\}\}/$consecutive_unavailable}"
+    template="${template//\{\{escalation_count\}\}/$escalation_count}"
     printf '%s' "$template"
 }
 
@@ -655,12 +694,16 @@ webhook_template() {
     case "${webhook}:${event}" in
         telegram:failure) fallback=$'🚨 <b>{{service}}</b> DOWN\n\nType: {{check_type}}\nDetail: {{detail}}\nTime: {{timestamp}}' ;;
         telegram:recovery) fallback=$'✅ <b>{{service}}</b> UP\n\nRecovered at {{timestamp}}' ;;
+        telegram:escalation) fallback=$'⚠️ <b>ESCALATION:</b> {{service}} has been unavailable for {{consecutive_unavailable}} consecutive checks.' ;;
         discord:failure) fallback='{"content":"🚨 **{{service}}** is unavailable: {{detail}}"}' ;;
         discord:recovery) fallback='{"content":"✅ **{{service}}** recovered"}' ;;
+        discord:escalation) fallback='{"content":"⚠️ **ESCALATION:** {{service}} has been unavailable for {{consecutive_unavailable}} consecutive checks."}' ;;
         slack:failure) fallback='{"text":"🚨 {{service}} DOWN: {{detail}}"}' ;;
         slack:recovery) fallback='{"text":"✅ {{service}} recovered"}' ;;
+        slack:escalation) fallback='{"text":"⚠️ ESCALATION: {{service}} has been unavailable for {{consecutive_unavailable}} consecutive checks."}' ;;
         ntfy:failure) fallback='🚨 {{service}} unavailable: {{detail}}' ;;
         ntfy:recovery) fallback='✅ {{service}} recovered' ;;
+        ntfy:escalation) fallback='⚠️ ESCALATION: {{service}} has been unavailable for {{consecutive_unavailable}} consecutive checks.' ;;
         *) return 1 ;;
     esac
     value_type="$(yaml_read ".notifications.webhooks.${webhook}.template.${event} | type")"
@@ -755,6 +798,11 @@ send_email_notification() {
         recovery)
             subject_template="$EMAIL_RECOVERY_SUBJECT"
             body_template="$EMAIL_RECOVERY_BODY"
+            ;;
+        escalation)
+            subject_template="[ESCALATION] ${EMAIL_FAILURE_SUBJECT}"
+            body_template=$'⚠️ ESCALATION — service {{service}} has been unavailable for {{consecutive_unavailable}} consecutive checks.\n\n{{detail}}\n\n'
+            body_template+="$EMAIL_FAILURE_BODY"
             ;;
         *)
             log ERROR "service=${CURRENT_SERVICE} result=email-failed reason=unknown-event event=${event}"
@@ -1022,6 +1070,97 @@ maintenance_marker_file() {
     printf '%s/%s.%s' "$STATE_DIRECTORY" "$service_name" "$marker"
 }
 
+read_service_marker_number() {
+    local service_name="$1" marker="$2" default_value="$3" file value=""
+    file="$(maintenance_marker_file "$service_name" "$marker")"
+    if [[ -r "$file" ]]; then
+        IFS= read -r value <"$file" || true
+    fi
+    [[ "$value" =~ ^[0-9]+$ ]] || value="$default_value"
+    printf '%s' "$value"
+}
+
+write_service_marker_number() {
+    local service_name="$1" marker="$2" value="$3" file temporary
+    file="$(maintenance_marker_file "$service_name" "$marker")"
+    temporary="${file}.tmp.$$"
+    printf '%s\n' "$value" >"$temporary" || die "Cannot write service state: ${temporary}"
+    chmod 0640 "$temporary" 2>/dev/null || true
+    mv -f -- "$temporary" "$file" || die "Cannot update service state: ${file}"
+}
+
+increment_unavailable_counter() {
+    local service_name="$1" current
+    (( DRY_RUN == 0 )) || return 0
+    current="$(read_service_marker_number "$service_name" unavailable-count 0)"
+    ESCALATION_CONSECUTIVE_UNAVAILABLE=$((10#$current + 1))
+    write_service_marker_number "$service_name" unavailable-count "$ESCALATION_CONSECUTIVE_UNAVAILABLE"
+    ESCALATION_COUNT="$(read_service_marker_number "$service_name" escalation-count 0)"
+    log WARN "service=${service_name} state=unavailable consecutive_unavailable=${ESCALATION_CONSECUTIVE_UNAVAILABLE}"
+}
+
+reset_unavailable_counter() {
+    local service_name="$1" current last_file
+    (( DRY_RUN == 0 )) || return 0
+    current="$(read_service_marker_number "$service_name" unavailable-count 0)"
+    ESCALATION_CONSECUTIVE_UNAVAILABLE=0
+    ESCALATION_COUNT=0
+    write_service_marker_number "$service_name" unavailable-count 0
+    write_service_marker_number "$service_name" escalation-count 0
+    last_file="$(maintenance_marker_file "$service_name" last-escalation)"
+    rm -f -- "$last_file"
+    if (( 10#$current > 0 )); then
+        log INFO "service=${service_name} state=healthy consecutive_unavailable=0 action=reset"
+    fi
+}
+
+should_escalate() {
+    local index="$1" service_name="$2" threshold cooldown cooldown_value last_escalation now remaining
+    [[ "$(yaml_read ".services[$index].escalation.enabled // false")" == true ]] || return 1
+    threshold="$(yaml_read ".services[$index].escalation.after_consecutive_unavailable")"
+    (( ESCALATION_CONSECUTIVE_UNAVAILABLE >= 10#$threshold )) || return 1
+    cooldown="$(yaml_read ".services[$index].escalation.cooldown // 0")"
+    cooldown_value=$((10#$cooldown))
+    last_escalation="$(read_service_marker_number "$service_name" last-escalation 0)"
+    (( cooldown_value == 0 || 10#$last_escalation == 0 )) && return 0
+    now="$(date '+%s')"
+    if (( now - 10#$last_escalation >= cooldown_value )); then
+        return 0
+    fi
+    remaining=$((cooldown_value - (now - 10#$last_escalation)))
+    log INFO "service=${service_name} event=escalation action=skipped reason=cooldown active=true remaining=${remaining}"
+    return 1
+}
+
+run_escalation() {
+    local index="$1" service_name="$2" cooldown notify last_escalation current_count
+    (( DRY_RUN == 0 )) || return 0
+    if (( MAINTENANCE_ACTIVE == 1 )); then
+        log INFO "service=${service_name} event=escalation action=skipped reason=maintenance-window"
+        return 0
+    fi
+    should_escalate "$index" "$service_name" || return 0
+    cooldown="$(yaml_read ".services[$index].escalation.cooldown // 0")"
+    current_count="$(read_service_marker_number "$service_name" escalation-count 0)"
+    ESCALATION_COUNT=$((10#$current_count + 1))
+    log WARN "service=${service_name} event=escalation consecutive_unavailable=${ESCALATION_CONSECUTIVE_UNAVAILABLE} cooldown=${cooldown} action=triggered"
+    if ! run_configured_sequence ".services[$index].escalation.actions.commands" escalation "$service_name"; then
+        log ERROR "service=${service_name} event=escalation action=commands-failed"
+    fi
+    notify="$(yaml_read ".services[$index].escalation.notify // true")"
+    if [[ "$notify" == true ]]; then
+        send_email_notification escalation || log ERROR "service=${service_name} result=escalation-email-failed"
+        send_webhook_notification escalation || log ERROR "service=${service_name} result=escalation-webhook-failed"
+    fi
+    if ! run_configured_sequence ".services[$index].escalation.hooks.on_escalation" escalation "$service_name"; then
+        log ERROR "service=${service_name} event=escalation action=hook-failed"
+    fi
+    last_escalation="$(date '+%s')"
+    write_service_marker_number "$service_name" escalation-count "$ESCALATION_COUNT"
+    write_service_marker_number "$service_name" last-escalation "$last_escalation"
+    log WARN "service=${service_name} event=escalation consecutive_unavailable=${ESCALATION_CONSECUTIVE_UNAVAILABLE} action=executed"
+}
+
 is_maintenance_window() {
     local service_name="$1" service_count index name timezone day now days time start end window_count window
     local matched_day normalized_day
@@ -1086,7 +1225,9 @@ record_maintenance_exit() {
     (( DRY_RUN == 0 )) || return 0
     active_file="$(maintenance_marker_file "$service_name" maintenance-active)"
     if [[ -e "$active_file" ]]; then
-        [[ -s "$active_file" ]] && IFS= read -r previous_window <"$active_file" || true
+        if [[ -s "$active_file" ]]; then
+            IFS= read -r previous_window <"$active_file" || true
+        fi
         rm -f -- "$active_file"
         log INFO "service=${service_name} maintenance_window=${previous_window} active=false"
     fi
@@ -1155,6 +1296,8 @@ process_service() {
     CURRENT_SERVICE="$(yaml_read ".services[$index].name")"
     CURRENT_CHECK_TYPE="$(yaml_read ".services[$index].check.type")"
     CURRENT_ACTION_STATUS="not-attempted"
+    ESCALATION_CONSECUTIVE_UNAVAILABLE=0
+    ESCALATION_COUNT=0
     CHECK_DETAIL=""
     CHECK_HTTP_STATUS=""
     CHECK_EXIT_CODE=""
@@ -1170,6 +1313,7 @@ process_service() {
     if check_with_retries "$index"; then
         CURRENT_ACTION_STATUS="not-required"
         update_maintenance_status "$CURRENT_SERVICE"
+        reset_unavailable_counter "$CURRENT_SERVICE"
         handle_state_transition "$CURRENT_SERVICE" healthy
         log INFO "service=${CURRENT_SERVICE} result=healthy"
         return 0
@@ -1214,6 +1358,7 @@ process_service() {
             if check_with_retries "$index"; then
                 CURRENT_ACTION_STATUS="successful"
                 update_maintenance_status "$CURRENT_SERVICE"
+                reset_unavailable_counter "$CURRENT_SERVICE"
                 handle_state_transition "$CURRENT_SERVICE" healthy
                 log WARN "service=${CURRENT_SERVICE} result=recovered-after-remediation"
                 return 0
@@ -1226,6 +1371,8 @@ process_service() {
         fi
     fi
 
+    increment_unavailable_counter "$CURRENT_SERVICE"
+    run_escalation "$index" "$CURRENT_SERVICE"
     UNHEALTHY_FOUND=1
     log ERROR "service=${CURRENT_SERVICE} result=unavailable detail=\"$(sanitize_detail "$CHECK_DETAIL")\""
     return 0

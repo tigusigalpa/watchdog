@@ -165,3 +165,23 @@ services:
             - systemctl
             - restart
             - example-worker
+
+    # Escalate only after normal remediation has not restored the service for
+    # several consecutive watchdog runs.
+    escalation:
+      enabled: true
+      after_consecutive_unavailable: 3
+      cooldown: 3600
+      notify: true
+      actions:
+        commands:
+          - command:
+              - systemctl
+              - restart
+              - docker
+            timeout: 60
+      hooks:
+        on_escalation:
+          - command:
+              - /usr/local/bin/page-oncall
+            timeout: 30
