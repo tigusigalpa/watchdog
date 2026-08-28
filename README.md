@@ -476,6 +476,38 @@ Escalation is suppressed during a maintenance window. Watchdog persists the
 counter, escalation count, and last escalation timestamp in sidecar files next
 to its existing state file, preserving compatibility with existing state files.
 
+### Prometheus Integration
+
+Watchdog can write Prometheus text exposition data for node_exporter's textfile
+collector. It does not run an HTTP server or require another exporter.
+
+```yaml
+metrics:
+  enabled: true
+  textfile_directory: /var/lib/node_exporter/textfile_collector
+  filename: watchdog.prom
+  prefix: watchdog
+  static_labels:
+    instance: prod-web-01
+    datacenter: msk-1
+```
+
+Configure node_exporter to collect the directory:
+
+```text
+--collector.textfile.directory=/var/lib/node_exporter/textfile_collector
+```
+
+After every watchdog run, the `.prom` file is atomically replaced and exposes
+service state, last-check and transition timestamps, consecutive failures,
+check and remediation counters, and the current outage duration. For example,
+use `watchdog_service_state{service="api"}` in Grafana or a Prometheus alert
+when that value equals `1`.
+
+```text
+watchdog → watchdog.prom → node_exporter → Prometheus → Grafana
+```
+
 ### Hooks and integrations
 
 `hooks.on_failure` and `hooks.on_recovery` run only on state transitions. Use
@@ -646,13 +678,14 @@ configured timeout before increasing the schedule interval.
 
 ```bash
 bash -n service-watchdog.sh install.sh tests/smoke.sh
-bash -n tests/email-notifications.sh tests/webhooks.sh tests/maintenance.sh tests/escalation.sh
-shellcheck service-watchdog.sh install.sh tests/smoke.sh tests/email-notifications.sh tests/webhooks.sh tests/maintenance.sh tests/escalation.sh
+bash -n tests/email-notifications.sh tests/webhooks.sh tests/maintenance.sh tests/escalation.sh tests/prometheus.sh
+shellcheck service-watchdog.sh install.sh tests/smoke.sh tests/email-notifications.sh tests/webhooks.sh tests/maintenance.sh tests/escalation.sh tests/prometheus.sh
 bash ./tests/smoke.sh
 bash ./tests/email-notifications.sh
 bash ./tests/webhooks.sh
 bash ./tests/maintenance.sh
 bash ./tests/escalation.sh
+bash ./tests/prometheus.sh
 ```
 
 The smoke test starts a local HTTP server and verifies both the healthy path and

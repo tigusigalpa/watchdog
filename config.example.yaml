@@ -9,6 +9,16 @@ settings:
   default_action_timeout: 120
   default_action_cooldown: 300
 
+# Optional Prometheus node_exporter textfile collector integration.
+metrics:
+  enabled: false
+  textfile_directory: /var/lib/node_exporter/textfile_collector
+  filename: watchdog.prom
+  prefix: watchdog
+  static_labels:
+    instance: prod-web-01
+    datacenter: msk-1
+
 # Built-in email is transition-based: one message when a service becomes
 # unavailable and one message when it becomes healthy again.
 notifications:

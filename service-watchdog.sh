@@ -35,6 +35,10 @@ MAINTENANCE_ACTIVE=0
 MAINTENANCE_WINDOW_NAME=""
 ESCALATION_CONSECUTIVE_UNAVAILABLE=0
 ESCALATION_COUNT=0
+METRICS_ENABLED=0
+METRICS_DIRECTORY=""
+METRICS_FILENAME="watchdog.prom"
+METRICS_PREFIX="watchdog"
 
 EMAIL_ENABLED=0
 EMAIL_SMTP_URL=""
@@ -398,6 +402,33 @@ validate_escalation_configuration() {
     fi
 }
 
+validate_metrics_configuration() {
+    local enabled value labels_type count index key value_type
+    enabled="$(yaml_read '.metrics.enabled // false')"
+    [[ "$enabled" == true || "$enabled" == false ]] || die "metrics.enabled must be true or false."
+    [[ "$enabled" == true ]] || return 0
+    validate_string '.metrics.textfile_directory' 'metrics.textfile_directory'
+    value="$(yaml_read '.metrics.textfile_directory')"
+    [[ "$value" == /* ]] || die "metrics.textfile_directory must be an absolute path."
+    validate_string '.metrics.filename' 'metrics.filename'
+    value="$(yaml_read '.metrics.filename')"
+    [[ -n "$value" && "$value" != */* ]] || die "metrics.filename must be a file name, not a path."
+    validate_string '.metrics.prefix' 'metrics.prefix'
+    value="$(yaml_read '.metrics.prefix')"
+    [[ "$value" =~ ^[A-Za-z_:][A-Za-z0-9_:]*$ ]] || die "metrics.prefix is not a valid Prometheus metric prefix."
+    labels_type="$(yaml_read '.metrics.static_labels | type')"
+    [[ "$labels_type" == "!!null" ]] && return 0
+    [[ "$labels_type" == "!!map" ]] || die "metrics.static_labels must be a YAML map."
+    count="$(yaml_read '.metrics.static_labels | length')"
+    for ((index = 0; index < count; index++)); do
+        key="$(yaml_read ".metrics.static_labels | to_entries[$index].key")"
+        [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || die "Invalid Prometheus static label name: ${key}"
+        value_type="$(yaml_read ".metrics.static_labels | to_entries[$index].value | type")"
+        [[ "$value_type" == "!!str" || "$value_type" == "!!int" || "$value_type" == "!!float" || "$value_type" == "!!bool" ]] ||
+            die "metrics.static_labels.${key} must be scalar."
+    done
+}
+
 validate_configuration() {
     local services_type service_count index name enabled check_type value value_type
     local status_count status_index status_code port actions_type hooks_type hook_name
@@ -513,6 +544,7 @@ validate_configuration() {
 
     validate_email_configuration
     validate_webhook_configuration
+    validate_metrics_configuration
 }
 
 configure_runtime() {
@@ -587,6 +619,16 @@ configure_email() {
         die "SMTP username is configured, but no password is available."
     [[ -n "$EMAIL_USERNAME" || -z "$EMAIL_PASSWORD" ]] ||
         die "SMTP password is configured, but smtp.username is empty."
+}
+
+configure_metrics() {
+    [[ "$(yaml_read '.metrics.enabled // false')" == true ]] || return 0
+    METRICS_ENABLED=1
+    METRICS_DIRECTORY="$(yaml_read '.metrics.textfile_directory')"
+    METRICS_FILENAME="$(yaml_read '.metrics.filename')"
+    METRICS_PREFIX="$(yaml_read '.metrics.prefix')"
+    [[ "$METRICS_FILENAME" == *.prom ]] ||
+        log WARN "result=metrics-warning reason=filename-not-prom filename=${METRICS_FILENAME}"
 }
 
 load_command() {
@@ -1009,6 +1051,7 @@ check_with_retries() {
     retry_delay="$(yaml_read ".services[$index].check.retry_delay // ${DEFAULT_RETRY_DELAY}")"
 
     for ((attempt = 1; attempt <= attempts; attempt++)); do
+        record_check_attempt "$CURRENT_SERVICE"
         log INFO "service=${CURRENT_SERVICE} action=check attempt=${attempt}/${attempts} type=${CURRENT_CHECK_TYPE}"
         if perform_single_check "$index"; then
             log INFO "service=${CURRENT_SERVICE} result=check-success attempt=${attempt}/${attempts} detail=\"$(sanitize_detail "$CHECK_DETAIL")\""
@@ -1063,6 +1106,7 @@ record_action_attempt() {
     printf '%s\n' "$(date '+%s')" >"$temporary" || die "Cannot write action state: ${temporary}"
     chmod 0640 "$temporary" 2>/dev/null || true
     mv -f -- "$temporary" "$file" || die "Cannot update action state: ${file}"
+    increment_service_marker_number "$service_name" remediations-total
 }
 
 maintenance_marker_file() {
@@ -1087,6 +1131,122 @@ write_service_marker_number() {
     printf '%s\n' "$value" >"$temporary" || die "Cannot write service state: ${temporary}"
     chmod 0640 "$temporary" 2>/dev/null || true
     mv -f -- "$temporary" "$file" || die "Cannot update service state: ${file}"
+}
+
+increment_service_marker_number() {
+    local service_name="$1" marker="$2" current
+    (( DRY_RUN == 0 )) || return 0
+    current="$(read_service_marker_number "$service_name" "$marker" 0)"
+    write_service_marker_number "$service_name" "$marker" "$((10#$current + 1))"
+}
+
+record_check_attempt() {
+    local service_name="$1"
+    (( DRY_RUN == 0 )) || return 0
+    increment_service_marker_number "$service_name" checks-total
+    write_service_marker_number "$service_name" last-check "$(date '+%s')"
+}
+
+record_state_transition_timestamp() {
+    local service_name="$1"
+    (( DRY_RUN == 0 )) || return 0
+    write_service_marker_number "$service_name" last-transition "$(date '+%s')"
+}
+
+escape_prometheus_label_value() {
+    local value="$1"
+    value="${value//\\/\\\\}"
+    value="${value//\"/\\\"}"
+    value="${value//$'\n'/\\n}"
+    printf '%s' "$value"
+}
+
+sanitize_prometheus_metric_name() {
+    local value="$1"
+    value="${value//[^A-Za-z0-9_:]/_}"
+    [[ "$value" =~ ^[A-Za-z_:] ]] || value="_${value}"
+    printf '%s' "$value"
+}
+
+prometheus_labels() {
+    local service_name="$1" check_type="$2" count index key value
+    printf 'service="%s",check_type="%s"' "$(escape_prometheus_label_value "$service_name")" "$(escape_prometheus_label_value "$check_type")"
+    count="$(yaml_read '.metrics.static_labels // {} | length')"
+    for ((index = 0; index < count; index++)); do
+        key="$(yaml_read ".metrics.static_labels | to_entries[$index].key")"
+        value="$(yaml_read ".metrics.static_labels | to_entries[$index].value")"
+        printf ',%s="%s"' "$key" "$(escape_prometheus_label_value "$value")"
+    done
+}
+
+write_prometheus_metrics() {
+    local target temporary service_count index service_name check_type state state_value now
+    local last_check last_transition failures checks remediations outage labels metric_prefix
+    (( METRICS_ENABLED == 1 )) || return 0
+    target="${METRICS_DIRECTORY}/${METRICS_FILENAME}"
+    if [[ ! -d "$METRICS_DIRECTORY" ]]; then
+        if ! mkdir -p -- "$METRICS_DIRECTORY" 2>/dev/null || ! chmod 0755 "$METRICS_DIRECTORY" 2>/dev/null; then
+            log ERROR "result=metrics-failed file=${target} reason=directory-not-writable"
+            return 0
+        fi
+    fi
+    if [[ ! -w "$METRICS_DIRECTORY" ]]; then
+        log ERROR "result=metrics-failed file=${target} reason=directory-not-writable"
+        return 0
+    fi
+    temporary="$(mktemp "${METRICS_DIRECTORY}/.${METRICS_FILENAME}.XXXXXX" 2>/dev/null)" || {
+        log ERROR "result=metrics-failed file=${target} reason=temporary-file"
+        return 0
+    }
+    metric_prefix="$(sanitize_prometheus_metric_name "$METRICS_PREFIX")"
+    now="$(date '+%s')"
+    service_count="$(yaml_read '.services | length')"
+    {
+        printf '# HELP %s_service_state Service availability state (0=healthy, 1=unavailable, 2=unknown)\n' "$metric_prefix"
+        printf '# TYPE %s_service_state gauge\n' "$metric_prefix"
+        printf '# HELP %s_service_last_check_timestamp Unix timestamp of the last check attempt\n' "$metric_prefix"
+        printf '# TYPE %s_service_last_check_timestamp gauge\n' "$metric_prefix"
+        printf '# HELP %s_service_last_transition_timestamp Unix timestamp of the last state transition\n' "$metric_prefix"
+        printf '# TYPE %s_service_last_transition_timestamp gauge\n' "$metric_prefix"
+        printf '# HELP %s_service_consecutive_failures Total consecutive unavailable checks since last healthy state\n' "$metric_prefix"
+        printf '# TYPE %s_service_consecutive_failures gauge\n' "$metric_prefix"
+        printf '# HELP %s_service_checks_total Total number of check attempts performed\n' "$metric_prefix"
+        printf '# TYPE %s_service_checks_total counter\n' "$metric_prefix"
+        printf '# HELP %s_service_remediations_total Total number of remediation attempts performed\n' "$metric_prefix"
+        printf '# TYPE %s_service_remediations_total counter\n' "$metric_prefix"
+        printf '# HELP %s_service_current_outage_duration_seconds Duration of the current outage in seconds\n' "$metric_prefix"
+        printf '# TYPE %s_service_current_outage_duration_seconds gauge\n' "$metric_prefix"
+        for ((index = 0; index < service_count; index++)); do
+            service_name="$(yaml_read ".services[$index].name")"
+            check_type="$(yaml_read ".services[$index].check.type")"
+            labels="$(prometheus_labels "$service_name" "$check_type")"
+            state="$(read_state "$service_name")"
+            case "$state" in healthy) state_value=0 ;; unavailable) state_value=1 ;; *) state_value=2 ;; esac
+            last_check="$(read_service_marker_number "$service_name" last-check 0)"
+            last_transition="$(read_service_marker_number "$service_name" last-transition 0)"
+            failures="$(read_service_marker_number "$service_name" unavailable-count 0)"
+            checks="$(read_service_marker_number "$service_name" checks-total 0)"
+            remediations="$(read_service_marker_number "$service_name" remediations-total 0)"
+            outage=0
+            if [[ "$state" == unavailable && "$last_transition" != 0 ]]; then
+                outage=$((now - 10#$last_transition))
+            fi
+            printf '%s_service_state{%s} %s\n' "$metric_prefix" "$labels" "$state_value"
+            printf '%s_service_last_check_timestamp{%s} %s\n' "$metric_prefix" "$labels" "$last_check"
+            printf '%s_service_last_transition_timestamp{%s} %s\n' "$metric_prefix" "$labels" "$last_transition"
+            printf '%s_service_consecutive_failures{%s} %s\n' "$metric_prefix" "$labels" "$failures"
+            printf '%s_service_checks_total{%s} %s\n' "$metric_prefix" "$labels" "$checks"
+            printf '%s_service_remediations_total{%s} %s\n' "$metric_prefix" "$labels" "$remediations"
+            printf '%s_service_current_outage_duration_seconds{%s} %s\n' "$metric_prefix" "$labels" "$outage"
+        done
+    } >"$temporary" || { rm -f -- "$temporary"; log ERROR "result=metrics-failed file=${target} reason=write"; return 0; }
+    chmod 0644 "$temporary" 2>/dev/null || true
+    if mv -f -- "$temporary" "$target"; then
+        log INFO "result=metrics-written file=${target} services=${service_count} metrics=7"
+    else
+        rm -f -- "$temporary"
+        log ERROR "result=metrics-failed file=${target} reason=rename"
+    fi
 }
 
 increment_unavailable_counter() {
@@ -1264,6 +1424,7 @@ handle_state_transition() {
             rm -f -- "$deferred_file"
         fi
         write_state "$service_name" "$new_state"
+        record_state_transition_timestamp "$service_name"
         log INFO "service=${service_name} event=state-change state=${new_state} maintenance_window=${MAINTENANCE_WINDOW_NAME} action=suppressed"
         return 0
     fi
@@ -1287,6 +1448,7 @@ handle_state_transition() {
             log ERROR "service=${service_name} result=state-hook-failed state=${new_state}"
     fi
     write_state "$service_name" "$new_state"
+    record_state_transition_timestamp "$service_name"
     log INFO "service=${service_name} action=state previous=${previous} current=${new_state}"
 }
 
@@ -1408,6 +1570,7 @@ main() {
     validate_configuration
     configure_runtime
     configure_email
+    configure_metrics
     TEMP_DIRECTORY="$(mktemp -d)" || die "Cannot create temporary directory."
     exec 9>"$LOCK_FILE" || die "Cannot open lock file: ${LOCK_FILE}"
     if ! flock --nonblock 9; then
@@ -1428,6 +1591,8 @@ main() {
     for ((index = 0; index < service_count; index++)); do
         process_service "$index"
     done
+
+    write_prometheus_metrics
 
     if (( UNHEALTHY_FOUND == 1 || ACTION_ATTEMPTED == 1 )); then
         log WARN "action=watchdog-finish exit=1 unhealthy=${UNHEALTHY_FOUND} remediation=${ACTION_ATTEMPTED}"
