@@ -1,6 +1,6 @@
 # Watchdog
 
-![Watchdog Hero Banner](https://i.postimg.cc/YCBRD2hr/watchdog-hero-banner-github.jpg)
+![Watchdog Hero Banner](https://i.postimg.cc/4ykZzvhr/watchdog-hero-site-monitoring.jpg)
 
 [![CI](https://github.com/tigusigalpa/watchdog/actions/workflows/ci.yml/badge.svg)](https://github.com/tigusigalpa/watchdog/actions/workflows/ci.yml)
 [![CodeQL](https://github.com/tigusigalpa/watchdog/actions/workflows/codeql.yml/badge.svg)](https://github.com/tigusigalpa/watchdog/actions/workflows/codeql.yml)
