@@ -3,9 +3,13 @@
 ![Watchdog Hero Banner](https://i.postimg.cc/YCBRD2hr/watchdog-hero-banner-github.jpg)
 
 [![CI](https://github.com/tigusigalpa/watchdog/actions/workflows/ci.yml/badge.svg)](https://github.com/tigusigalpa/watchdog/actions/workflows/ci.yml)
+[![CodeQL](https://github.com/tigusigalpa/watchdog/actions/workflows/codeql.yml/badge.svg)](https://github.com/tigusigalpa/watchdog/actions/workflows/codeql.yml)
 [![GitHub release](https://img.shields.io/github/v/release/tigusigalpa/watchdog)](https://github.com/tigusigalpa/watchdog/releases)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Bash 4.3+](https://img.shields.io/badge/bash-4.3%2B-4EAA25?logo=gnubash&logoColor=white)](https://www.gnu.org/software/bash/)
+[![ShellCheck](https://img.shields.io/badge/lint-ShellCheck-4EAA25?logo=gnubash&logoColor=white)](https://www.shellcheck.net/)
+[![GitHub issues](https://img.shields.io/github/issues/tigusigalpa/watchdog)](https://github.com/tigusigalpa/watchdog/issues)
+[![GitHub stars](https://img.shields.io/github/stars/tigusigalpa/watchdog?style=social)](https://github.com/tigusigalpa/watchdog/stargazers)
 
 A small, dependency-light Bash watchdog for websites and services. It runs
 configured health checks and executes an explicit command sequence when a
@@ -508,6 +512,42 @@ when that value equals `1`.
 watchdog → watchdog.prom → node_exporter → Prometheus → Grafana
 ```
 
+### Dependency Chains
+
+Declare service dependencies to prevent alert storms and pointless downstream
+remediation when a shared prerequisite is unavailable. Watchdog topologically
+orders services so dependencies are checked before their consumers.
+
+```yaml
+services:
+  - name: db
+    check: { type: tcp, host: 127.0.0.1, port: 5432 }
+
+  - name: api
+    check: { type: http, url: http://127.0.0.1:8080/health }
+    depends_on:
+      - name: db
+        required: true
+
+  - name: frontend
+    check: { type: http, url: http://127.0.0.1:3000 }
+    depends_on:
+      - name: api
+        required: true
+```
+
+```text
+db [required] → api [required] → frontend
+```
+
+When a required dependency is `unavailable` or `dependency_failed`, the
+downstream service is recorded as `dependency_failed`; its check, remediation,
+and transition notifications are skipped. A downstream service already marked
+`unavailable` retains that state to avoid masking its own incident. Set
+`required: false` for a soft dependency: Watchdog logs a warning but continues
+the downstream check. Missing dependency names and circular graphs are rejected
+as configuration errors.
+
 ### Hooks and integrations
 
 `hooks.on_failure` and `hooks.on_recovery` run only on state transitions. Use
@@ -678,14 +718,15 @@ configured timeout before increasing the schedule interval.
 
 ```bash
 bash -n service-watchdog.sh install.sh tests/smoke.sh
-bash -n tests/email-notifications.sh tests/webhooks.sh tests/maintenance.sh tests/escalation.sh tests/prometheus.sh
-shellcheck service-watchdog.sh install.sh tests/smoke.sh tests/email-notifications.sh tests/webhooks.sh tests/maintenance.sh tests/escalation.sh tests/prometheus.sh
+bash -n tests/email-notifications.sh tests/webhooks.sh tests/maintenance.sh tests/escalation.sh tests/prometheus.sh tests/dependencies.sh
+shellcheck service-watchdog.sh install.sh tests/smoke.sh tests/email-notifications.sh tests/webhooks.sh tests/maintenance.sh tests/escalation.sh tests/prometheus.sh tests/dependencies.sh
 bash ./tests/smoke.sh
 bash ./tests/email-notifications.sh
 bash ./tests/webhooks.sh
 bash ./tests/maintenance.sh
 bash ./tests/escalation.sh
 bash ./tests/prometheus.sh
+bash ./tests/dependencies.sh
 ```
 
 The smoke test starts a local HTTP server and verifies both the healthy path and

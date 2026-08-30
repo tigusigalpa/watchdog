@@ -142,6 +142,12 @@ services:
           days: "Sat,Sun"
           time: "00:00-06:00"
 
+    # Required dependencies are checked first. If one is unavailable, this
+    # service is recorded as dependency_failed without check or remediation.
+    depends_on:
+      - name: local-postgresql
+        required: true
+
   - name: local-postgresql
     check:
       type: tcp
@@ -195,3 +201,13 @@ services:
           - command:
               - /usr/local/bin/page-oncall
             timeout: 30
+
+  - name: public-frontend
+    check:
+      type: http
+      url: https://example.com
+    depends_on:
+      - name: example-website
+        required: true
+      - name: local-postgresql
+        required: false

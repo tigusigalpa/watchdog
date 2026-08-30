@@ -39,6 +39,12 @@ METRICS_ENABLED=0
 METRICS_DIRECTORY=""
 METRICS_FILENAME="watchdog.prom"
 METRICS_PREFIX="watchdog"
+PROCESS_RESULT="unknown"
+declare -A SERVICE_INDEX=()
+declare -A DEPENDENCY_NAMES=()
+declare -A DEPENDENCY_REQUIRED=()
+declare -A RESOLVED_STATE=()
+SERVICE_ORDER=()
 
 EMAIL_ENABLED=0
 EMAIL_SMTP_URL=""
@@ -429,6 +435,57 @@ validate_metrics_configuration() {
     done
 }
 
+build_dependency_graph() {
+    local service_count index service_name dependencies_type dependency_count dependency dependency_name required
+    local candidate candidate_dependencies candidate_dependency progress blocked
+
+    SERVICE_INDEX=(); DEPENDENCY_NAMES=(); DEPENDENCY_REQUIRED=(); SERVICE_ORDER=()
+    service_count="$(yaml_read '.services | length')"
+    for ((index = 0; index < service_count; index++)); do
+        service_name="$(yaml_read ".services[$index].name")"
+        SERVICE_INDEX["$service_name"]="$index"
+        DEPENDENCY_NAMES["$service_name"]=""
+    done
+    for ((index = 0; index < service_count; index++)); do
+        service_name="$(yaml_read ".services[$index].name")"
+        dependencies_type="$(yaml_read ".services[$index].depends_on | type")"
+        [[ "$dependencies_type" == "!!null" ]] && continue
+        [[ "$dependencies_type" == "!!seq" ]] || die "Service '${service_name}': depends_on must be a YAML array."
+        dependency_count="$(yaml_read ".services[$index].depends_on | length")"
+        for ((dependency = 0; dependency < dependency_count; dependency++)); do
+            validate_string ".services[$index].depends_on[$dependency].name" \
+                "Service '${service_name}': depends_on[$dependency].name"
+            dependency_name="$(yaml_read ".services[$index].depends_on[$dependency].name")"
+            [[ -n "${SERVICE_INDEX[$dependency_name]:-}" ]] ||
+                die "result=config-error reason=missing_dependency service=${service_name} dependency=${dependency_name}"
+            required="$(yaml_read ".services[$index].depends_on[$dependency].required // true")"
+            [[ "$required" == true || "$required" == false ]] ||
+                die "Service '${service_name}': depends_on[$dependency].required must be true or false."
+            DEPENDENCY_NAMES["$service_name"]+=" ${dependency_name}"
+            DEPENDENCY_REQUIRED["${service_name}:${dependency_name}"]="$required"
+        done
+    done
+
+    local -A completed=()
+    while (( ${#SERVICE_ORDER[@]} < service_count )); do
+        progress=0
+        for ((index = 0; index < service_count; index++)); do
+            candidate="$(yaml_read ".services[$index].name")"
+            [[ -z "${completed[$candidate]:-}" ]] || continue
+            candidate_dependencies="${DEPENDENCY_NAMES[$candidate]:-}"
+            blocked=0
+            for candidate_dependency in $candidate_dependencies; do
+                [[ -n "${completed[$candidate_dependency]:-}" ]] || { blocked=1; break; }
+            done
+            (( blocked == 0 )) || continue
+            completed["$candidate"]=1
+            SERVICE_ORDER+=("$candidate")
+            progress=1
+        done
+        (( progress == 1 )) || die "result=config-error reason=circular_dependency cycle=dependency-graph"
+    done
+}
+
 validate_configuration() {
     local services_type service_count index name enabled check_type value value_type
     local status_count status_index status_code port actions_type hooks_type hook_name
@@ -545,6 +602,7 @@ validate_configuration() {
     validate_email_configuration
     validate_webhook_configuration
     validate_metrics_configuration
+    build_dependency_graph
 }
 
 configure_runtime() {
@@ -1071,7 +1129,7 @@ read_state() {
     if [[ -r "$file" ]]; then
         IFS= read -r state <"$file" || true
     fi
-    case "$state" in healthy|unavailable) printf '%s' "$state" ;; *) printf unknown ;; esac
+    case "$state" in healthy|unavailable|dependency_failed) printf '%s' "$state" ;; *) printf unknown ;; esac
 }
 
 write_state() {
@@ -1221,7 +1279,7 @@ write_prometheus_metrics() {
             check_type="$(yaml_read ".services[$index].check.type")"
             labels="$(prometheus_labels "$service_name" "$check_type")"
             state="$(read_state "$service_name")"
-            case "$state" in healthy) state_value=0 ;; unavailable) state_value=1 ;; *) state_value=2 ;; esac
+            case "$state" in healthy) state_value=0 ;; unavailable|dependency_failed) state_value=1 ;; *) state_value=2 ;; esac
             last_check="$(read_service_marker_number "$service_name" last-check 0)"
             last_transition="$(read_service_marker_number "$service_name" last-transition 0)"
             failures="$(read_service_marker_number "$service_name" unavailable-count 0)"
@@ -1452,12 +1510,54 @@ handle_state_transition() {
     log INFO "service=${service_name} action=state previous=${previous} current=${new_state}"
 }
 
+handle_dependency_failure() {
+    local service_name="$1" dependency_name="$2" previous
+    previous="$(read_state "$service_name")"
+    if [[ "$previous" == unavailable ]]; then
+        PROCESS_RESULT=unavailable
+        log WARN "service=${service_name} state=unavailable dependency=${dependency_name} note=already_unavailable_before_dependency"
+        return 0
+    fi
+    (( DRY_RUN == 0 )) || { PROCESS_RESULT=dependency_failed; return 0; }
+    write_state "$service_name" dependency_failed
+    record_state_transition_timestamp "$service_name"
+    PROCESS_RESULT=dependency_failed
+    log WARN "service=${service_name} state=dependency_failed dependency=${dependency_name} reason=required_dependency_unavailable"
+}
+
+required_dependency_is_unavailable() {
+    local service_name="$1" dependency_name dependency_state required
+    for dependency_name in ${DEPENDENCY_NAMES[$service_name]:-}; do
+        dependency_state="${RESOLVED_STATE[$dependency_name]:-unknown}"
+        required="${DEPENDENCY_REQUIRED[${service_name}:${dependency_name}]:-true}"
+        if [[ "$dependency_state" == unavailable || "$dependency_state" == dependency_failed ]]; then
+            if [[ "$required" == true ]]; then
+                log WARN "service=${service_name} dependency=${dependency_name} required=true dependency_state=${dependency_state} action=skip reason=dependency_failed"
+                printf '%s' "$dependency_name"
+                return 0
+            fi
+            log WARN "service=${service_name} dependency=${dependency_name} required=false dependency_state=${dependency_state} action=proceed reason=optional_dependency_down"
+        fi
+    done
+    return 1
+}
+
+service_is_required_for() {
+    local target_service="$1" candidate_service="$2" dependency_name
+    for dependency_name in ${DEPENDENCY_NAMES[$target_service]:-}; do
+        [[ "$dependency_name" == "$candidate_service" ]] && return 0
+        service_is_required_for "$dependency_name" "$candidate_service" && return 0
+    done
+    return 1
+}
+
 process_service() {
     local index="$1"
     local enabled actions_count verify_after action_due=0
     CURRENT_SERVICE="$(yaml_read ".services[$index].name")"
     CURRENT_CHECK_TYPE="$(yaml_read ".services[$index].check.type")"
     CURRENT_ACTION_STATUS="not-attempted"
+    PROCESS_RESULT="unknown"
     ESCALATION_CONSECUTIVE_UNAVAILABLE=0
     ESCALATION_COUNT=0
     CHECK_DETAIL=""
@@ -1465,9 +1565,16 @@ process_service() {
     CHECK_EXIT_CODE=""
     enabled="$(yaml_read ".services[$index].enabled // true")"
 
-    [[ -z "$ONLY_SERVICE" || "$CURRENT_SERVICE" == "$ONLY_SERVICE" ]] || return 0
     if [[ "$enabled" != true ]]; then
         log INFO "service=${CURRENT_SERVICE} result=skipped reason=disabled"
+        PROCESS_RESULT="$(read_state "$CURRENT_SERVICE")"
+        return 0
+    fi
+
+    local failed_dependency=""
+    failed_dependency="$(required_dependency_is_unavailable "$CURRENT_SERVICE")" || true
+    if [[ -n "$failed_dependency" ]]; then
+        handle_dependency_failure "$CURRENT_SERVICE" "$failed_dependency"
         return 0
     fi
 
@@ -1477,6 +1584,7 @@ process_service() {
         update_maintenance_status "$CURRENT_SERVICE"
         reset_unavailable_counter "$CURRENT_SERVICE"
         handle_state_transition "$CURRENT_SERVICE" healthy
+        PROCESS_RESULT=healthy
         log INFO "service=${CURRENT_SERVICE} result=healthy"
         return 0
     fi
@@ -1522,6 +1630,7 @@ process_service() {
                 update_maintenance_status "$CURRENT_SERVICE"
                 reset_unavailable_counter "$CURRENT_SERVICE"
                 handle_state_transition "$CURRENT_SERVICE" healthy
+                PROCESS_RESULT=healthy
                 log WARN "service=${CURRENT_SERVICE} result=recovered-after-remediation"
                 return 0
             fi
@@ -1535,6 +1644,7 @@ process_service() {
 
     increment_unavailable_counter "$CURRENT_SERVICE"
     run_escalation "$index" "$CURRENT_SERVICE"
+    PROCESS_RESULT=unavailable
     UNHEALTHY_FOUND=1
     log ERROR "service=${CURRENT_SERVICE} result=unavailable detail=\"$(sanitize_detail "$CHECK_DETAIL")\""
     return 0
@@ -1588,8 +1698,14 @@ main() {
         (( matched == 1 )) || die "Service not found: ${ONLY_SERVICE}"
     fi
 
-    for ((index = 0; index < service_count; index++)); do
+    RESOLVED_STATE=()
+    for name in "${SERVICE_ORDER[@]}"; do
+        if [[ -n "$ONLY_SERVICE" && "$name" != "$ONLY_SERVICE" ]] && ! service_is_required_for "$ONLY_SERVICE" "$name"; then
+            continue
+        fi
+        index="${SERVICE_INDEX[$name]}"
         process_service "$index"
+        RESOLVED_STATE["$name"]="$PROCESS_RESULT"
     done
 
     write_prometheus_metrics
