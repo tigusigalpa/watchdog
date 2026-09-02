@@ -279,7 +279,7 @@ validate_webhook_configuration() {
             die "notifications.webhooks.${webhook}.enabled must be true or false."
         [[ "$enabled" == true ]] || continue
 
-        for value in failure recovery escalation; do
+        for value in failure recovery escalation circuit_open circuit_close; do
             value_type="$(yaml_read ".notifications.webhooks.${webhook}.template.${value} | type")"
             [[ "$value_type" == "!!null" ]] ||
                 validate_string ".notifications.webhooks.${webhook}.template.${value}" \
@@ -406,6 +406,28 @@ validate_escalation_configuration() {
         validate_command_sequence ".services[$index].escalation.hooks.on_escalation" \
             "Service '${service_name}': escalation.hooks.on_escalation" true
     fi
+}
+
+validate_circuit_breaker_configuration() {
+    local index="$1" service_name="$2" type enabled value value_type
+    type="$(yaml_read ".services[$index].circuit_breaker | type")"
+    [[ "$type" == "!!null" ]] && return 0
+    [[ "$type" == "!!map" ]] || die "Service '${service_name}': circuit_breaker must be a YAML map."
+    enabled="$(yaml_read ".services[$index].circuit_breaker.enabled")"
+    [[ "$enabled" == true || "$enabled" == false ]] || die "Service '${service_name}': circuit_breaker.enabled must be true or false."
+    [[ "$enabled" == true ]] || return 0
+    value="$(yaml_read ".services[$index].circuit_breaker.failure_threshold")"
+    is_positive_integer "$value" || die "Service '${service_name}': circuit_breaker.failure_threshold must be a positive integer."
+    value="$(yaml_read ".services[$index].circuit_breaker.open_duration")"
+    is_positive_integer "$value" || die "Service '${service_name}': circuit_breaker.open_duration must be a positive integer."
+    value="$(yaml_read ".services[$index].circuit_breaker.half_open_verify_after // 0")"
+    is_non_negative_integer "$value" || die "Service '${service_name}': circuit_breaker.half_open_verify_after must be non-negative."
+    value="$(yaml_read ".services[$index].circuit_breaker.notify // true")"
+    [[ "$value" == true || "$value" == false ]] || die "Service '${service_name}': circuit_breaker.notify must be true or false."
+    value_type="$(yaml_read ".services[$index].circuit_breaker.hooks.on_open | type")"
+    [[ "$value_type" == "!!null" ]] || validate_command_sequence ".services[$index].circuit_breaker.hooks.on_open" "Service '${service_name}': circuit_breaker.hooks.on_open" true
+    value_type="$(yaml_read ".services[$index].circuit_breaker.hooks.on_close | type")"
+    [[ "$value_type" == "!!null" ]] || validate_command_sequence ".services[$index].circuit_breaker.hooks.on_close" "Service '${service_name}': circuit_breaker.hooks.on_close" true
 }
 
 validate_metrics_configuration() {
@@ -586,6 +608,7 @@ validate_configuration() {
             die "Service '${name}': actions.verify_after must be a non-negative integer."
         validate_maintenance_configuration "$index" "$name"
         validate_escalation_configuration "$index" "$name"
+        validate_circuit_breaker_configuration "$index" "$name"
     done
 
     hooks_type="$(yaml_read '.hooks | type')"
@@ -795,15 +818,23 @@ webhook_template() {
         telegram:failure) fallback=$'🚨 <b>{{service}}</b> DOWN\n\nType: {{check_type}}\nDetail: {{detail}}\nTime: {{timestamp}}' ;;
         telegram:recovery) fallback=$'✅ <b>{{service}}</b> UP\n\nRecovered at {{timestamp}}' ;;
         telegram:escalation) fallback=$'⚠️ <b>ESCALATION:</b> {{service}} has been unavailable for {{consecutive_unavailable}} consecutive checks.' ;;
+        telegram:circuit_open) fallback='⚠️ <b>CIRCUIT BREAKER OPEN:</b> {{service}}' ;;
+        telegram:circuit_close) fallback='✅ <b>CIRCUIT BREAKER CLOSED:</b> {{service}}' ;;
         discord:failure) fallback='{"content":"🚨 **{{service}}** is unavailable: {{detail}}"}' ;;
         discord:recovery) fallback='{"content":"✅ **{{service}}** recovered"}' ;;
         discord:escalation) fallback='{"content":"⚠️ **ESCALATION:** {{service}} has been unavailable for {{consecutive_unavailable}} consecutive checks."}' ;;
+        discord:circuit_open) fallback='{"content":"⚠️ **CIRCUIT BREAKER OPEN:** {{service}}"}' ;;
+        discord:circuit_close) fallback='{"content":"✅ **CIRCUIT BREAKER CLOSED:** {{service}}"}' ;;
         slack:failure) fallback='{"text":"🚨 {{service}} DOWN: {{detail}}"}' ;;
         slack:recovery) fallback='{"text":"✅ {{service}} recovered"}' ;;
         slack:escalation) fallback='{"text":"⚠️ ESCALATION: {{service}} has been unavailable for {{consecutive_unavailable}} consecutive checks."}' ;;
+        slack:circuit_open) fallback='{"text":"⚠️ CIRCUIT BREAKER OPEN: {{service}}"}' ;;
+        slack:circuit_close) fallback='{"text":"✅ CIRCUIT BREAKER CLOSED: {{service}}"}' ;;
         ntfy:failure) fallback='🚨 {{service}} unavailable: {{detail}}' ;;
         ntfy:recovery) fallback='✅ {{service}} recovered' ;;
         ntfy:escalation) fallback='⚠️ ESCALATION: {{service}} has been unavailable for {{consecutive_unavailable}} consecutive checks.' ;;
+        ntfy:circuit_open) fallback='⚠️ CIRCUIT BREAKER OPEN: {{service}}' ;;
+        ntfy:circuit_close) fallback='✅ CIRCUIT BREAKER CLOSED: {{service}}' ;;
         *) return 1 ;;
     esac
     value_type="$(yaml_read ".notifications.webhooks.${webhook}.template.${event} | type")"
@@ -903,6 +934,14 @@ send_email_notification() {
             subject_template="[ESCALATION] ${EMAIL_FAILURE_SUBJECT}"
             body_template=$'⚠️ ESCALATION — service {{service}} has been unavailable for {{consecutive_unavailable}} consecutive checks.\n\n{{detail}}\n\n'
             body_template+="$EMAIL_FAILURE_BODY"
+            ;;
+        circuit_open)
+            subject_template="[CIRCUIT BREAKER OPEN] ${CURRENT_SERVICE}"
+            body_template='Circuit breaker opened after repeated failed remediation. Service: {{service}}. Detail: {{detail}}'
+            ;;
+        circuit_close)
+            subject_template="[CIRCUIT BREAKER CLOSED] ${CURRENT_SERVICE}"
+            body_template='Circuit breaker closed because the service is healthy again. Service: {{service}}.'
             ;;
         *)
             log ERROR "service=${CURRENT_SERVICE} result=email-failed reason=unknown-event event=${event}"
@@ -1189,6 +1228,98 @@ write_service_marker_number() {
     printf '%s\n' "$value" >"$temporary" || die "Cannot write service state: ${temporary}"
     chmod 0640 "$temporary" 2>/dev/null || true
     mv -f -- "$temporary" "$file" || die "Cannot update service state: ${file}"
+}
+
+read_service_marker_string() {
+    local service_name="$1" marker="$2" default_value="$3" file value=""
+    file="$(maintenance_marker_file "$service_name" "$marker")"
+    if [[ -r "$file" ]]; then
+        IFS= read -r value <"$file" || true
+    fi
+    [[ -n "$value" ]] || value="$default_value"
+    printf '%s' "$value"
+}
+
+write_service_marker_string() {
+    local service_name="$1" marker="$2" value="$3" file temporary
+    file="$(maintenance_marker_file "$service_name" "$marker")"
+    temporary="${file}.tmp.$$"
+    printf '%s\n' "$value" >"$temporary" || die "Cannot write service state: ${temporary}"
+    chmod 0640 "$temporary" 2>/dev/null || true
+    mv -f -- "$temporary" "$file" || die "Cannot update service state: ${file}"
+}
+
+send_circuit_breaker_notification() {
+    local index="$1" service_name="$2" event="$3" notify hook_expression
+    notify="$(yaml_read ".services[$index].circuit_breaker.notify // true")"
+    if [[ "$notify" == true ]]; then
+        send_email_notification "circuit_${event}" || log ERROR "service=${service_name} result=circuit-email-failed event=${event}"
+        send_webhook_notification "circuit_${event}" || log ERROR "service=${service_name} result=circuit-webhook-failed event=${event}"
+    fi
+    hook_expression=".services[$index].circuit_breaker.hooks.on_${event}"
+    run_configured_sequence "$hook_expression" "circuit-${event}" "$service_name" ||
+        log ERROR "service=${service_name} result=circuit-hook-failed event=${event}"
+    log WARN "service=${service_name} event=circuit_breaker_${event} notify=${notify}"
+}
+
+should_run_actions_with_circuit_breaker() {
+    local index="$1" service_name="$2" circuit_state last_open open_duration now remaining
+    [[ "$(yaml_read ".services[$index].circuit_breaker.enabled // false")" == true ]] || return 0
+    circuit_state="$(read_service_marker_string "$service_name" circuit-state closed)"
+    case "$circuit_state" in
+        closed) return 0 ;;
+        open)
+            last_open="$(read_service_marker_number "$service_name" last-circuit-open 0)"
+            open_duration="$(yaml_read ".services[$index].circuit_breaker.open_duration")"
+            now="$(date '+%s')"
+            if (( 10#$last_open > 0 && now - 10#$last_open >= 10#$open_duration )); then
+                write_service_marker_string "$service_name" circuit-state half_open
+                write_service_marker_number "$service_name" last-half-open-attempt "$now"
+                log WARN "service=${service_name} circuit_state=open action=half_open reason=open_duration_expired"
+                return 0
+            fi
+            remaining=$((10#$open_duration - (now - 10#$last_open)))
+            log INFO "service=${service_name} circuit_state=open last_open=${last_open} remaining=${remaining} action=skipped reason=circuit_breaker"
+            return 1
+            ;;
+        half_open) return 0 ;;
+        *) write_service_marker_string "$service_name" circuit-state closed; return 0 ;;
+    esac
+}
+
+record_circuit_action_result() {
+    local index="$1" service_name="$2" success="$3" circuit_state failures threshold now
+    [[ "$(yaml_read ".services[$index].circuit_breaker.enabled // false")" == true ]] || return 0
+    circuit_state="$(read_service_marker_string "$service_name" circuit-state closed)"
+    if [[ "$success" == true ]]; then
+        write_service_marker_string "$service_name" circuit-state closed
+        write_service_marker_number "$service_name" circuit-failure-count 0
+        rm -f -- "$(maintenance_marker_file "$service_name" last-circuit-open)"
+        if [[ "$circuit_state" == open || "$circuit_state" == half_open ]]; then
+            log INFO "service=${service_name} circuit_state=${circuit_state} action=verify result=success next_state=closed"
+            send_circuit_breaker_notification "$index" "$service_name" close
+        fi
+        return 0
+    fi
+    now="$(date '+%s')"
+    if [[ "$circuit_state" == half_open ]]; then
+        write_service_marker_string "$service_name" circuit-state open
+        write_service_marker_number "$service_name" last-circuit-open "$now"
+        log WARN "service=${service_name} circuit_state=half_open action=verify result=failed next_state=open"
+        send_circuit_breaker_notification "$index" "$service_name" open
+        return 0
+    fi
+    failures="$(read_service_marker_number "$service_name" circuit-failure-count 0)"
+    failures=$((10#$failures + 1))
+    write_service_marker_number "$service_name" circuit-failure-count "$failures"
+    threshold="$(yaml_read ".services[$index].circuit_breaker.failure_threshold")"
+    log WARN "service=${service_name} circuit_state=closed circuit_failure_count=${failures} action=remediation result=failed"
+    if (( failures >= 10#$threshold )); then
+        write_service_marker_string "$service_name" circuit-state open
+        write_service_marker_number "$service_name" last-circuit-open "$now"
+        log WARN "service=${service_name} circuit_state=closed circuit_failure_count=${failures} threshold=${threshold} action=trip reason=failure_threshold_reached"
+        send_circuit_breaker_notification "$index" "$service_name" open
+    fi
 }
 
 increment_service_marker_number() {
@@ -1553,7 +1684,7 @@ service_is_required_for() {
 
 process_service() {
     local index="$1"
-    local enabled actions_count verify_after action_due=0
+    local enabled actions_count verify_after circuit_state action_due=0 half_open_attempt=0
     CURRENT_SERVICE="$(yaml_read ".services[$index].name")"
     CURRENT_CHECK_TYPE="$(yaml_read ".services[$index].check.type")"
     CURRENT_ACTION_STATUS="not-attempted"
@@ -1582,6 +1713,7 @@ process_service() {
     if check_with_retries "$index"; then
         CURRENT_ACTION_STATUS="not-required"
         update_maintenance_status "$CURRENT_SERVICE"
+        record_circuit_action_result "$index" "$CURRENT_SERVICE" true
         reset_unavailable_counter "$CURRENT_SERVICE"
         handle_state_transition "$CURRENT_SERVICE" healthy
         PROCESS_RESULT=healthy
@@ -1597,6 +1729,12 @@ process_service() {
         CURRENT_ACTION_STATUS="skipped-dry-run"
     elif (( MAINTENANCE_ACTIVE == 1 )); then
         CURRENT_ACTION_STATUS="skipped-maintenance"
+    elif ! should_run_actions_with_circuit_breaker "$index" "$CURRENT_SERVICE"; then
+        CURRENT_ACTION_STATUS="skipped-circuit-breaker"
+    elif [[ "$(read_service_marker_string "$CURRENT_SERVICE" circuit-state closed)" == half_open ]]; then
+        CURRENT_ACTION_STATUS="pending-half-open"
+        action_due=1
+        half_open_attempt=1
     elif action_is_due "$index" "$CURRENT_SERVICE"; then
         CURRENT_ACTION_STATUS="pending"
         action_due=1
@@ -1623,11 +1761,16 @@ process_service() {
                 CURRENT_ACTION_STATUS="command-failed"
             fi
 
-            verify_after="$(yaml_read ".services[$index].actions.verify_after // 0")"
+            if (( half_open_attempt == 1 )); then
+                verify_after="$(yaml_read ".services[$index].circuit_breaker.half_open_verify_after // 0")"
+            else
+                verify_after="$(yaml_read ".services[$index].actions.verify_after // 0")"
+            fi
             (( verify_after > 0 )) && sleep "$verify_after"
             if check_with_retries "$index"; then
                 CURRENT_ACTION_STATUS="successful"
                 update_maintenance_status "$CURRENT_SERVICE"
+                record_circuit_action_result "$index" "$CURRENT_SERVICE" true
                 reset_unavailable_counter "$CURRENT_SERVICE"
                 handle_state_transition "$CURRENT_SERVICE" healthy
                 PROCESS_RESULT=healthy
@@ -1637,8 +1780,13 @@ process_service() {
             if [[ "$CURRENT_ACTION_STATUS" == commands-succeeded ]]; then
                 CURRENT_ACTION_STATUS="verification-failed"
             fi
+            record_circuit_action_result "$index" "$CURRENT_SERVICE" false
         else
-            log WARN "service=${CURRENT_SERVICE} action=remediation result=skipped reason=cooldown"
+            if [[ "$CURRENT_ACTION_STATUS" == skipped-circuit-breaker ]]; then
+                log WARN "service=${CURRENT_SERVICE} action=remediation result=skipped reason=circuit-breaker"
+            else
+                log WARN "service=${CURRENT_SERVICE} action=remediation result=skipped reason=cooldown"
+            fi
         fi
     fi
 

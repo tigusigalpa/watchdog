@@ -202,6 +202,20 @@ services:
               - /usr/local/bin/page-oncall
             timeout: 30
 
+    circuit_breaker:
+      enabled: true
+      failure_threshold: 3
+      open_duration: 1800
+      half_open_verify_after: 30
+      notify: true
+      hooks:
+        on_open:
+          - command: [/usr/local/bin/notify-sre]
+            timeout: 30
+        on_close:
+          - command: [/usr/local/bin/notify-sre]
+            timeout: 30
+
   - name: public-frontend
     check:
       type: http

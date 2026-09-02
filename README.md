@@ -548,6 +548,33 @@ and transition notifications are skipped. A downstream service already marked
 the downstream check. Missing dependency names and circular graphs are rejected
 as configuration errors.
 
+### Circuit Breaker
+
+Circuit breaker prevents a persistently broken service from repeatedly
+restarting itself. Health checks always continue, so current availability stays
+visible in the log and metrics.
+
+```yaml
+circuit_breaker:
+  enabled: true
+  failure_threshold: 3
+  open_duration: 1800
+  half_open_verify_after: 30
+  notify: true
+```
+
+```text
+CLOSED → [failure threshold] → OPEN → [open duration] → HALF-OPEN
+  ↑                              │                         │
+  └──────────── [verify success] ┴────── [verify fail] ────┘
+```
+
+Only a complete failed remediation cycle increments the circuit failure count.
+While OPEN, Watchdog skips remediation commands. At the end of `open_duration`,
+it performs one half-open remediation attempt; success closes and resets the
+circuit, while failure reopens it. Optional `on_open` and `on_close` hooks and
+notifications run for those state changes.
+
 ### Hooks and integrations
 
 `hooks.on_failure` and `hooks.on_recovery` run only on state transitions. Use
@@ -718,8 +745,8 @@ configured timeout before increasing the schedule interval.
 
 ```bash
 bash -n service-watchdog.sh install.sh tests/smoke.sh
-bash -n tests/email-notifications.sh tests/webhooks.sh tests/maintenance.sh tests/escalation.sh tests/prometheus.sh tests/dependencies.sh
-shellcheck service-watchdog.sh install.sh tests/smoke.sh tests/email-notifications.sh tests/webhooks.sh tests/maintenance.sh tests/escalation.sh tests/prometheus.sh tests/dependencies.sh
+bash -n tests/email-notifications.sh tests/webhooks.sh tests/maintenance.sh tests/escalation.sh tests/prometheus.sh tests/dependencies.sh tests/circuit-breaker.sh
+shellcheck service-watchdog.sh install.sh tests/smoke.sh tests/email-notifications.sh tests/webhooks.sh tests/maintenance.sh tests/escalation.sh tests/prometheus.sh tests/dependencies.sh tests/circuit-breaker.sh
 bash ./tests/smoke.sh
 bash ./tests/email-notifications.sh
 bash ./tests/webhooks.sh
@@ -727,6 +754,7 @@ bash ./tests/maintenance.sh
 bash ./tests/escalation.sh
 bash ./tests/prometheus.sh
 bash ./tests/dependencies.sh
+bash ./tests/circuit-breaker.sh
 ```
 
 The smoke test starts a local HTTP server and verifies both the healthy path and
