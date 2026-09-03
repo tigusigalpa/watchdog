@@ -39,6 +39,10 @@ METRICS_ENABLED=0
 METRICS_DIRECTORY=""
 METRICS_FILENAME="watchdog.prom"
 METRICS_PREFIX="watchdog"
+STATUS_PAGE_ENABLED=0
+STATUS_PAGE_DIRECTORY=""
+STATUS_PAGE_HTML_FILENAME="index.html"
+STATUS_PAGE_JSON_FILENAME=""
 PROCESS_RESULT="unknown"
 declare -A SERVICE_INDEX=()
 declare -A DEPENDENCY_NAMES=()
@@ -457,6 +461,30 @@ validate_metrics_configuration() {
     done
 }
 
+validate_status_page_configuration() {
+    local enabled value theme_key type refresh
+    enabled="$(yaml_read '.status_page.enabled // false')"
+    [[ "$enabled" == true || "$enabled" == false ]] || die "status_page.enabled must be true or false."
+    [[ "$enabled" == true ]] || return 0
+    validate_string '.status_page.output_directory' 'status_page.output_directory'
+    value="$(yaml_read '.status_page.output_directory')"
+    [[ "$value" == /* ]] || die "status_page.output_directory must be an absolute path."
+    for theme_key in html_filename json_filename title description logo_url footer; do
+        type="$(yaml_read ".status_page.${theme_key} | type")"
+        [[ "$type" == "!!null" ]] || validate_string ".status_page.${theme_key}" "status_page.${theme_key}"
+    done
+    for theme_key in html_filename json_filename; do
+        value="$(yaml_read ".status_page.${theme_key} // \"\"")"
+        [[ -z "$value" || "$value" != */* ]] || die "status_page.${theme_key} must be a file name, not a path."
+    done
+    for theme_key in primary danger warning bg card text muted; do
+        value="$(yaml_read ".status_page.theme.${theme_key} // \"\"")"
+        [[ -z "$value" || "$value" =~ ^[0-9A-Fa-f]{6}$ ]] || die "status_page.theme.${theme_key} must be a six-character hex color."
+    done
+    refresh="$(yaml_read '.status_page.auto_refresh // 0')"
+    is_non_negative_integer "$refresh" || die "status_page.auto_refresh must be non-negative."
+}
+
 build_dependency_graph() {
     local service_count index service_name dependencies_type dependency_count dependency dependency_name required
     local candidate candidate_dependencies candidate_dependency progress blocked
@@ -625,6 +653,7 @@ validate_configuration() {
     validate_email_configuration
     validate_webhook_configuration
     validate_metrics_configuration
+    validate_status_page_configuration
     build_dependency_graph
 }
 
@@ -710,6 +739,14 @@ configure_metrics() {
     METRICS_PREFIX="$(yaml_read '.metrics.prefix')"
     [[ "$METRICS_FILENAME" == *.prom ]] ||
         log WARN "result=metrics-warning reason=filename-not-prom filename=${METRICS_FILENAME}"
+}
+
+configure_status_page() {
+    [[ "$(yaml_read '.status_page.enabled // false')" == true ]] || return 0
+    STATUS_PAGE_ENABLED=1
+    STATUS_PAGE_DIRECTORY="$(yaml_read '.status_page.output_directory')"
+    STATUS_PAGE_HTML_FILENAME="$(yaml_read '.status_page.html_filename // "index.html"')"
+    STATUS_PAGE_JSON_FILENAME="$(yaml_read '.status_page.json_filename // ""')"
 }
 
 load_command() {
@@ -1438,6 +1475,81 @@ write_prometheus_metrics() {
     fi
 }
 
+escape_status_html() {
+    local value="$1"
+    value="${value//&/\&amp;}"; value="${value//</\&lt;}"; value="${value//>/\&gt;}"; value="${value//\"/\&quot;}"
+    printf '%s' "$value"
+}
+
+format_status_timestamp() {
+    local timestamp="$1"
+    [[ "$timestamp" =~ ^[0-9]+$ && "$timestamp" != 0 ]] || { printf '%s' 'Never'; return; }
+    date -d "@${timestamp}" '+%Y-%m-%d %H:%M:%S %z' 2>/dev/null || printf '%s' 'Unknown'
+}
+
+status_page_overall_status() {
+    local service_count index state degraded=0
+    service_count="$(yaml_read '.services | length')"
+    for ((index = 0; index < service_count; index++)); do
+        state="$(read_state "$(yaml_read ".services[$index].name")")"
+        [[ "$state" == unavailable ]] && { printf '%s' major_outage; return; }
+        [[ "$state" == dependency_failed || "$state" == unknown ]] && degraded=1
+    done
+    (( degraded == 1 )) && printf '%s' degraded || printf '%s' operational
+}
+
+status_page_service_card() {
+    local service_name="$1" check_type="$2" state="$3" last_check="$4" last_transition="$5" label class
+    case "$state" in
+        healthy) label='Operational'; class='healthy' ;;
+        unavailable) label='Down'; class='down' ;;
+        dependency_failed) label='Dependency Failed'; class='warning' ;;
+        *) label='Unknown'; class='warning' ;;
+    esac
+    printf '<article class="service"><div><strong>%s</strong><small>%s · last check: %s · changed: %s</small></div><span class="status %s">● %s</span></article>\n' \
+        "$(escape_status_html "$service_name")" "$(escape_status_html "$check_type")" \
+        "$(escape_status_html "$(format_status_timestamp "$last_check")")" \
+        "$(escape_status_html "$(format_status_timestamp "$last_transition")")" "$class" "$label"
+}
+
+generate_status_page() {
+    local target html_tmp json_tmp service_count index service_name check_type state last_check last_transition
+    local title description logo footer refresh primary danger warning bg card text_color muted overall overall_label overall_class generated
+    (( STATUS_PAGE_ENABLED == 1 )) || return 0
+    target="${STATUS_PAGE_DIRECTORY}/${STATUS_PAGE_HTML_FILENAME}"
+    if [[ ! -d "$STATUS_PAGE_DIRECTORY" ]] && ! mkdir -p -- "$STATUS_PAGE_DIRECTORY" 2>/dev/null; then
+        log ERROR "result=status-page-failed file=${target} reason=directory-not-writable"; return 0
+    fi
+    [[ -w "$STATUS_PAGE_DIRECTORY" ]] || { log ERROR "result=status-page-failed file=${target} reason=directory-not-writable"; return 0; }
+    html_tmp="$(mktemp "${STATUS_PAGE_DIRECTORY}/.${STATUS_PAGE_HTML_FILENAME}.XXXXXX" 2>/dev/null)" || { log ERROR "result=status-page-failed file=${target} reason=temporary-file"; return 0; }
+    title="$(yaml_read '.status_page.title // "Service Status"')"; description="$(yaml_read '.status_page.description // "Current availability of monitored services"')"
+    logo="$(yaml_read '.status_page.logo_url // ""')"; footer="$(yaml_read '.status_page.footer // "Powered by Watchdog"')"; refresh="$(yaml_read '.status_page.auto_refresh // 0')"
+    primary="$(yaml_read '.status_page.theme.primary // "2563eb"')"; danger="$(yaml_read '.status_page.theme.danger // "dc2626"')"; warning="$(yaml_read '.status_page.theme.warning // "f59e0b"')"; bg="$(yaml_read '.status_page.theme.bg // "f8fafc"')"; card="$(yaml_read '.status_page.theme.card // "ffffff"')"; text_color="$(yaml_read '.status_page.theme.text // "1e293b"')"; muted="$(yaml_read '.status_page.theme.muted // "64748b"')"
+    overall="$(status_page_overall_status)"; generated="$(date '+%Y-%m-%d %H:%M:%S %z')"; service_count="$(yaml_read '.services | length')"
+    case "$overall" in operational) overall_label='All Systems Operational'; overall_class='healthy' ;; major_outage) overall_label='Major Outage'; overall_class='down' ;; *) overall_label='Partial Outage'; overall_class='warning' ;; esac
+    {
+        printf '<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">\n'
+        (( refresh > 0 )) && printf '<meta http-equiv="refresh" content="%s">\n' "$refresh"
+        printf '<title>%s</title><style>:root{--p:#%s;--d:#%s;--w:#%s;--bg:#%s;--card:#%s;--text:#%s;--muted:#%s}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:16px -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}.wrap{max-width:850px;margin:auto;padding:32px 18px}header{text-align:center;margin-bottom:26px}h1{margin:8px 0}p,small,footer{color:var(--muted)}.overall,.service{background:var(--card);border-radius:12px;padding:16px;margin:12px 0;box-shadow:0 1px 3px #0001}.overall{text-align:center;font-weight:700}.service{display:flex;align-items:center;justify-content:space-between;gap:16px}.service small{display:block;margin-top:5px}.status{white-space:nowrap}.healthy{color:var(--p)}.down{color:var(--d)}.warning{color:var(--w)}footer{text-align:center;margin-top:28px;font-size:13px}@media(max-width:550px){.service{align-items:flex-start;flex-direction:column;gap:7px}}</style></head><body><main class="wrap"><header>' "$primary" "$danger" "$warning" "$bg" "$card" "$text_color" "$muted"
+        [[ -z "$logo" ]] || printf '<img src="%s" alt="" style="max-height:56px">' "$(escape_status_html "$logo")"
+        printf '<h1>%s</h1><p>%s</p></header><div class="overall %s">%s</div><section><h2>Services</h2>\n' "$(escape_status_html "$title")" "$(escape_status_html "$description")" "$overall_class" "$overall_label"
+        for ((index = 0; index < service_count; index++)); do
+            service_name="$(yaml_read ".services[$index].name")"; check_type="$(yaml_read ".services[$index].check.type")"; state="$(read_state "$service_name")"
+            last_check="$(read_service_marker_number "$service_name" last-check 0)"; last_transition="$(read_service_marker_number "$service_name" last-transition 0)"
+            status_page_service_card "$service_name" "$check_type" "$state" "$last_check" "$last_transition"
+        done
+        printf '</section><footer>%s<br>Generated by Watchdog at %s</footer></main></body></html>\n' "$(escape_status_html "$footer")" "$generated"
+    } >"$html_tmp" || { rm -f -- "$html_tmp"; log ERROR "result=status-page-failed file=${target} reason=write"; return 0; }
+    chmod 0644 "$html_tmp" 2>/dev/null || true; mv -f -- "$html_tmp" "$target" || { rm -f -- "$html_tmp"; log ERROR "result=status-page-failed file=${target} reason=rename"; return 0; }
+    if [[ -n "$STATUS_PAGE_JSON_FILENAME" ]]; then
+        json_tmp="$(mktemp "${STATUS_PAGE_DIRECTORY}/.${STATUS_PAGE_JSON_FILENAME}.XXXXXX" 2>/dev/null)" || return 0
+        { printf '{\n  "generated_at": "%s",\n  "overall_status": "%s",\n  "services": [\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$overall"
+          for ((index = 0; index < service_count; index++)); do service_name="$(yaml_read ".services[$index].name")"; check_type="$(yaml_read ".services[$index].check.type")"; state="$(read_state "$service_name")"; last_check="$(read_service_marker_number "$service_name" last-check 0)"; last_transition="$(read_service_marker_number "$service_name" last-transition 0)"; printf '    {"name":"%s","status":"%s","check_type":"%s","last_check":"%s","last_transition":"%s"}%s\n' "$(escape_json "$service_name")" "$state" "$check_type" "$(format_status_timestamp "$last_check")" "$(format_status_timestamp "$last_transition")" "$([[ $index -lt $((service_count - 1)) ]] && printf ',' )"; done
+          printf '  ]\n}\n'; } >"$json_tmp" && { chmod 0644 "$json_tmp" 2>/dev/null || true; mv -f -- "$json_tmp" "${STATUS_PAGE_DIRECTORY}/${STATUS_PAGE_JSON_FILENAME}"; }
+    fi
+    log INFO "result=status-page-written file=${target} services=${service_count} overall=${overall}"
+}
+
 increment_unavailable_counter() {
     local service_name="$1" current
     (( DRY_RUN == 0 )) || return 0
@@ -1829,6 +1941,7 @@ main() {
     configure_runtime
     configure_email
     configure_metrics
+    configure_status_page
     TEMP_DIRECTORY="$(mktemp -d)" || die "Cannot create temporary directory."
     exec 9>"$LOCK_FILE" || die "Cannot open lock file: ${LOCK_FILE}"
     if ! flock --nonblock 9; then
@@ -1857,6 +1970,7 @@ main() {
     done
 
     write_prometheus_metrics
+    generate_status_page
 
     if (( UNHEALTHY_FOUND == 1 || ACTION_ATTEMPTED == 1 )); then
         log WARN "action=watchdog-finish exit=1 unhealthy=${UNHEALTHY_FOUND} remediation=${ACTION_ATTEMPTED}"

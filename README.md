@@ -575,6 +575,45 @@ it performs one half-open remediation attempt; success closes and resets the
 circuit, while failure reopens it. Optional `on_open` and `on_close` hooks and
 notifications run for those state changes.
 
+### Status Page
+
+Generate a self-hosted, dependency-free status page on every watchdog run. The
+page is a single responsive HTML file with inline CSS; an optional JSON file is
+also useful for custom front ends.
+
+```yaml
+status_page:
+  enabled: true
+  output_directory: /var/www/status
+  html_filename: index.html
+  json_filename: status.json
+  title: My Services Status
+  description: Real-time availability of monitored services
+  auto_refresh: 60
+```
+
+Serve the generated directory with nginx:
+
+```nginx
+location /status {
+    alias /var/www/status;
+    try_files $uri $uri/ /index.html;
+}
+```
+
+```text
+┌──────────────────────────────┐
+│ My Services Status           │
+│ ● All Systems Operational    │
+├──────────────────────────────┤
+│ api       ● Operational      │
+│ database  ● Operational      │
+└──────────────────────────────┘
+```
+
+Files are atomically replaced, so nginx, Apache, Caddy, or static hosting can
+serve them safely without a runtime dependency beyond Watchdog itself.
+
 ### Hooks and integrations
 
 `hooks.on_failure` and `hooks.on_recovery` run only on state transitions. Use
@@ -745,8 +784,8 @@ configured timeout before increasing the schedule interval.
 
 ```bash
 bash -n service-watchdog.sh install.sh tests/smoke.sh
-bash -n tests/email-notifications.sh tests/webhooks.sh tests/maintenance.sh tests/escalation.sh tests/prometheus.sh tests/dependencies.sh tests/circuit-breaker.sh
-shellcheck service-watchdog.sh install.sh tests/smoke.sh tests/email-notifications.sh tests/webhooks.sh tests/maintenance.sh tests/escalation.sh tests/prometheus.sh tests/dependencies.sh tests/circuit-breaker.sh
+bash -n tests/email-notifications.sh tests/webhooks.sh tests/maintenance.sh tests/escalation.sh tests/prometheus.sh tests/dependencies.sh tests/circuit-breaker.sh tests/status-page.sh
+shellcheck service-watchdog.sh install.sh tests/smoke.sh tests/email-notifications.sh tests/webhooks.sh tests/maintenance.sh tests/escalation.sh tests/prometheus.sh tests/dependencies.sh tests/circuit-breaker.sh tests/status-page.sh
 bash ./tests/smoke.sh
 bash ./tests/email-notifications.sh
 bash ./tests/webhooks.sh
@@ -755,6 +794,7 @@ bash ./tests/escalation.sh
 bash ./tests/prometheus.sh
 bash ./tests/dependencies.sh
 bash ./tests/circuit-breaker.sh
+bash ./tests/status-page.sh
 ```
 
 The smoke test starts a local HTTP server and verifies both the healthy path and

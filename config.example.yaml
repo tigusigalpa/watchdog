@@ -19,6 +19,26 @@ metrics:
     instance: prod-web-01
     datacenter: msk-1
 
+# Optional self-hosted static status page.
+status_page:
+  enabled: false
+  output_directory: /var/www/status
+  html_filename: index.html
+  json_filename: status.json
+  title: My Services Status
+  description: Real-time availability of monitored services
+  logo_url: ""
+  auto_refresh: 60
+  footer: Powered by Watchdog
+  theme:
+    primary: "2563eb"
+    danger: "dc2626"
+    warning: "f59e0b"
+    bg: "f8fafc"
+    card: "ffffff"
+    text: "1e293b"
+    muted: "64748b"
+
 # Built-in email is transition-based: one message when a service becomes
 # unavailable and one message when it becomes healthy again.
 notifications:
