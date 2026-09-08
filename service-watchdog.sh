@@ -1392,11 +1392,13 @@ write_parallel_result() {
 
 _run_single_check_bg() {
     local index="$1" service_name="$2" result_file="$3" log_file="$4" timeout_value worker_pid timer_pid="" check_state=unavailable
+    # Check helpers use TEMP_DIRECTORY for curl and command output. Shadow it
+    # for this worker so concurrent checks never share temporary files.
+    local TEMP_DIRECTORY="${TEMP_DIRECTORY}/${service_name}.${BASHPID}"
     (
         exec >"$log_file" 2>&1
         CURRENT_SERVICE="$service_name"; CURRENT_CHECK_TYPE="$(yaml_read ".services[$index].check.type")"
         CHECK_DETAIL=""; CHECK_HTTP_STATUS=""; CHECK_EXIT_CODE=""; PARALLEL_CHECK_MODE=1
-        TEMP_DIRECTORY="${TEMP_DIRECTORY}/${service_name}.${BASHPID}"
         mkdir -p -- "$TEMP_DIRECTORY" || exit 1
         timeout_value="$(parallel_timeout_for_service "$index")"; worker_pid="$BASHPID"
         if (( timeout_value > 0 )); then
