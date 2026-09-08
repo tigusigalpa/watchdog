@@ -1,4 +1,4 @@
-# Watchdog
+# Watchdog. Sites Monitoring Bash-script
 
 ![Watchdog Hero Banner](https://i.postimg.cc/4ykZzvhr/watchdog-hero-site-monitoring.jpg)
 
@@ -512,6 +512,61 @@ when that value equals `1`.
 watchdog → watchdog.prom → node_exporter → Prometheus → Grafana
 ```
 
+### Templates (DRY)
+
+`templates` removes repetitive service defaults such as HTTP timeouts, retry
+counts, and action cooldowns. A service selects one named template with
+`template`; its own fields then override the template. Templates are expanded
+once when Watchdog starts, before configuration validation and checks. Edit a
+template and let the next timer run start a new process to apply the change.
+
+```yaml
+templates:
+  default_http:
+    check:
+      type: http
+      timeout: 10
+      attempts: 3
+      retry_delay: 2
+      success_status: [200, 204]
+    actions:
+      cooldown: 300
+      verify_after: 10
+
+services:
+  - name: api
+    template: default_http
+    check:
+      url: https://api.example.com/health
+    actions:
+      commands:
+        - command: [docker, compose, restart, api]
+```
+
+The default `deep` mode recursively merges maps, so `api` inherits
+`check.type`, timeouts, retries, and action defaults while keeping its own URL
+and remediation command. Values supplied by the service take precedence.
+
+Use `template_mode: shallow` when a service must replace a whole top-level
+section instead of extending it:
+
+```yaml
+templates:
+  default_http:
+    check: { type: http, timeout: 10, attempts: 3 }
+
+services:
+  - name: special-probe
+    template: default_http
+    template_mode: shallow
+    check: { type: command, commands: [{ command: [/usr/local/bin/probe] }] }
+```
+
+Here `check` is taken entirely from `special-probe`; it does not inherit the
+HTTP type, timeout, or attempts. Template names must be unique simple names,
+and templates cannot inherit from other templates. `name`, `template`, and
+`template_mode` inside a template are ignored with a warning.
+
 ### Dependency Chains
 
 Declare service dependencies to prevent alert storms and pointless downstream
@@ -547,6 +602,41 @@ and transition notifications are skipped. A downstream service already marked
 `required: false` for a soft dependency: Watchdog logs a warning but continues
 the downstream check. Missing dependency names and circular graphs are rejected
 as configuration errors.
+
+### Parallel Checks
+
+For installations with many independent services, enable parallel health
+checks to reduce the duration of each one-shot run. Remediation commands,
+state changes, hooks, and notifications remain strictly sequential: only the
+read-only check phase runs concurrently.
+
+```yaml
+parallel:
+  enabled: true
+  max_jobs: 10     # 0 means no concurrency limit
+  timeout: 60      # fallback per-check timeout; check.timeout wins
+  temp_dir: ""     # empty uses a private /tmp/watchdog.* directory
+
+services:
+  - name: api
+    check: { type: http, url: https://api.example.com/health }
+
+  - name: legacy-job
+    parallel: false # explicitly keep this check sequential
+    check: { type: command, commands: [{ command: ["/usr/local/bin/check-job"] }] }
+```
+
+Without dependencies, all eligible checks form one batch. Dependency chains
+run level by level: Watchdog collects and processes the root batch before it
+starts checks that rely on those roots. A required failed dependency therefore
+still prevents a downstream check and remediation.
+
+For example, twenty three-second checks take about sixty seconds one at a time
+and about three seconds in a sufficiently large parallel batch. Set
+`max_jobs` conservatively for the host and its network; an unlimited batch is
+useful for small configurations but can overload DNS, file descriptors, or the
+services being monitored. Check worker output and results are isolated in a
+temporary directory, then replayed in service order by the main process.
 
 ### Circuit Breaker
 

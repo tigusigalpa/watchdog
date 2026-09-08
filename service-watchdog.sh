@@ -18,6 +18,7 @@ LOG_FILE=""
 LOCK_FILE=""
 STATE_DIRECTORY=""
 TEMP_DIRECTORY=""
+EXPANDED_CONFIG_FILE=""
 
 DEFAULT_TIMEOUT=10
 DEFAULT_ATTEMPTS=2
@@ -43,12 +44,26 @@ STATUS_PAGE_ENABLED=0
 STATUS_PAGE_DIRECTORY=""
 STATUS_PAGE_HTML_FILENAME="index.html"
 STATUS_PAGE_JSON_FILENAME=""
+PARALLEL_ENABLED=0
+PARALLEL_MAX_JOBS=0
+PARALLEL_TIMEOUT=0
+PARALLEL_TEMP_BASE=""
+PARALLEL_CHECK_MODE=0
+PARALLEL_ATTEMPTS_MADE=0
 PROCESS_RESULT="unknown"
 declare -A SERVICE_INDEX=()
 declare -A DEPENDENCY_NAMES=()
 declare -A DEPENDENCY_REQUIRED=()
 declare -A RESOLVED_STATE=()
+declare -A SERVICE_LEVEL=()
+declare -A PRELOADED_CHECK_STATE=()
+declare -A PRELOADED_CHECK_DETAIL=()
+declare -A PRELOADED_CHECK_HTTP_STATUS=()
+declare -A PRELOADED_CHECK_EXIT_CODE=()
+declare -A PRELOADED_CHECK_ATTEMPTS=()
 SERVICE_ORDER=()
+TEMPLATE_EXPANSION_LOG=()
+TEMPLATE_WARNING_LOG=()
 
 EMAIL_ENABLED=0
 EMAIL_SMTP_URL=""
@@ -113,6 +128,9 @@ cleanup() {
     if [[ -n "${TEMP_DIRECTORY:-}" && -d "$TEMP_DIRECTORY" ]]; then
         rm -rf -- "$TEMP_DIRECTORY"
     fi
+    if [[ -n "${EXPANDED_CONFIG_FILE:-}" && -f "$EXPANDED_CONFIG_FILE" ]]; then
+        rm -f -- "$EXPANDED_CONFIG_FILE"
+    fi
 }
 
 trap cleanup EXIT
@@ -124,6 +142,87 @@ require_command() {
 
 yaml_read() {
     yq eval -r "$1" "$CONFIG_FILE"
+}
+
+validate_templates() {
+    local templates_type template_count template_index template_name template_name_type template_type
+    local reserved_field reserved_type warning service_count service_index service_name
+    local template_reference template_reference_type mode mode_type template_exists
+
+    templates_type="$(yaml_read '.templates | type' 2>/dev/null)" || die "Cannot read templates."
+    case "$templates_type" in
+        "!!null") template_count=0 ;;
+        "!!map") template_count="$(yaml_read '.templates | length')" ;;
+        *) die "templates must be a YAML map." ;;
+    esac
+    for ((template_index = 0; template_index < template_count; template_index++)); do
+        template_name_type="$(yaml_read ".templates | to_entries[$template_index].key | type")"
+        [[ "$template_name_type" == "!!str" ]] || die "Template names must be strings."
+        template_name="$(yaml_read ".templates | to_entries[$template_index].key")"
+        [[ "$template_name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die "Invalid template name: ${template_name}"
+        template_type="$(yaml_read ".templates | to_entries[$template_index].value | type")"
+        [[ "$template_type" == "!!map" ]] || die "Template '${template_name}' must be a YAML map."
+        for reserved_field in name template template_mode; do
+            reserved_type="$(yaml_read ".templates[\"${template_name}\"].${reserved_field} | type")"
+            if [[ "$reserved_type" != "!!null" ]]; then
+                warning="template=${template_name} warning=template_contains_${reserved_field} ignored=true"
+                TEMPLATE_WARNING_LOG+=("$warning")
+                bootstrap_log WARN "$warning"
+            fi
+        done
+    done
+
+    service_count="$(yaml_read '.services | length')"
+    for ((service_index = 0; service_index < service_count; service_index++)); do
+        service_name="$(yaml_read ".services[$service_index].name // \"index-${service_index}\"")"
+        template_reference_type="$(yaml_read ".services[$service_index].template | type")"
+        [[ "$template_reference_type" == "!!null" ]] && continue
+        [[ "$template_reference_type" == "!!str" ]] || die "Service '${service_name}': template must be a string."
+        template_reference="$(yaml_read ".services[$service_index].template")"
+        [[ "$template_reference" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die "Service '${service_name}': template must be a valid template name."
+        [[ "$templates_type" == "!!map" ]] || die "result=config-error reason=missing_template service=${service_name} template=${template_reference}"
+        template_exists="$(yaml_read ".templates | has(\"${template_reference}\")")"
+        [[ "$template_exists" == true ]] || die "result=config-error reason=missing_template service=${service_name} template=${template_reference}"
+        mode_type="$(yaml_read ".services[$service_index].template_mode | type")"
+        [[ "$mode_type" == "!!null" || "$mode_type" == "!!str" ]] || die "Service '${service_name}': template_mode must be deep or shallow."
+        mode="$(yaml_read ".services[$service_index].template_mode // \"deep\"")"
+        [[ "$mode" == deep || "$mode" == shallow ]] || die "result=config-error reason=invalid_template_mode service=${service_name} mode=${mode}"
+    done
+}
+
+expand_templates() {
+    local service_count service_index service_name template_name mode fields_inherited merge_expression
+
+    [[ "$(yaml_read '.templates | type')" == "!!map" ]] || return 0
+    EXPANDED_CONFIG_FILE="$(mktemp "${TMPDIR:-/tmp}/service-watchdog.templates.XXXXXX.yaml")" || die "Cannot create expanded template configuration."
+    yq eval '.' "$CONFIG_FILE" >"$EXPANDED_CONFIG_FILE" || die "Cannot expand templates."
+    service_count="$(yq eval -r '.services | length' "$EXPANDED_CONFIG_FILE")"
+    for ((service_index = 0; service_index < service_count; service_index++)); do
+        template_name="$(yq eval -r ".services[$service_index].template // \"\"" "$EXPANDED_CONFIG_FILE")"
+        [[ -n "$template_name" ]] || continue
+        service_name="$(yq eval -r ".services[$service_index].name" "$EXPANDED_CONFIG_FILE")"
+        mode="$(yq eval -r ".services[$service_index].template_mode // \"deep\"" "$EXPANDED_CONFIG_FILE")"
+        fields_inherited="$(yq eval -r "((.templates[\"${template_name}\"] | del(.name, .template, .template_mode) | keys) - (.services[$service_index] | del(.template, .template_mode) | keys)) | length" "$EXPANDED_CONFIG_FILE")"
+        case "$mode" in
+            deep) merge_expression="(.templates[\"${template_name}\"] | del(.name, .template, .template_mode)) * (.services[$service_index] | del(.template, .template_mode))" ;;
+            shallow) merge_expression="(.templates[\"${template_name}\"] | del(.name, .template, .template_mode)) + (.services[$service_index] | del(.template, .template_mode))" ;;
+            *) die "result=config-error reason=invalid_template_mode service=${service_name} mode=${mode}" ;;
+        esac
+        yq eval -i ".services[$service_index] = (${merge_expression})" "$EXPANDED_CONFIG_FILE" || die "Cannot merge template '${template_name}' for service '${service_name}'."
+        TEMPLATE_EXPANSION_LOG+=("template=${template_name} service=${service_name} mode=${mode} result=merged fields_inherited=${fields_inherited}")
+    done
+    yq eval -i 'del(.templates)' "$EXPANDED_CONFIG_FILE" || die "Cannot finalize expanded template configuration."
+    CONFIG_FILE="$EXPANDED_CONFIG_FILE"
+}
+
+log_template_expansions() {
+    local entry
+    for entry in "${TEMPLATE_WARNING_LOG[@]}"; do
+        log WARN "$entry"
+    done
+    for entry in "${TEMPLATE_EXPANSION_LOG[@]}"; do
+        log INFO "$entry"
+    done
 }
 
 is_positive_integer() {
@@ -485,11 +584,29 @@ validate_status_page_configuration() {
     is_non_negative_integer "$refresh" || die "status_page.auto_refresh must be non-negative."
 }
 
+validate_parallel_configuration() {
+    local value value_type
+    value_type="$(yaml_read '.parallel | type')"
+    [[ "$value_type" == "!!null" || "$value_type" == "!!map" ]] || die "parallel must be a YAML map."
+    value="$(yaml_read '.parallel.enabled // false')"
+    [[ "$value" == true || "$value" == false ]] || die "parallel.enabled must be true or false."
+    value="$(yaml_read '.parallel.max_jobs // 0')"
+    is_non_negative_integer "$value" || die "parallel.max_jobs must be a non-negative integer."
+    value="$(yaml_read '.parallel.timeout // 0')"
+    is_non_negative_integer "$value" || die "parallel.timeout must be a non-negative integer."
+    value_type="$(yaml_read '.parallel.temp_dir | type')"
+    [[ "$value_type" == "!!null" || "$value_type" == "!!str" ]] || die "parallel.temp_dir must be a string."
+    if [[ "$value_type" == "!!str" ]]; then
+        value="$(yaml_read '.parallel.temp_dir')"
+        [[ -z "$value" || "$value" == /* ]] || die "parallel.temp_dir must be an absolute path."
+    fi
+}
+
 build_dependency_graph() {
     local service_count index service_name dependencies_type dependency_count dependency dependency_name required
     local candidate candidate_dependencies candidate_dependency progress blocked
 
-    SERVICE_INDEX=(); DEPENDENCY_NAMES=(); DEPENDENCY_REQUIRED=(); SERVICE_ORDER=()
+    SERVICE_INDEX=(); DEPENDENCY_NAMES=(); DEPENDENCY_REQUIRED=(); SERVICE_LEVEL=(); SERVICE_ORDER=()
     service_count="$(yaml_read '.services | length')"
     for ((index = 0; index < service_count; index++)); do
         service_name="$(yaml_read ".services[$index].name")"
@@ -517,6 +634,7 @@ build_dependency_graph() {
     done
 
     local -A completed=()
+    local candidate_level dependency_level
     while (( ${#SERVICE_ORDER[@]} < service_count )); do
         progress=0
         for ((index = 0; index < service_count; index++)); do
@@ -528,7 +646,13 @@ build_dependency_graph() {
                 [[ -n "${completed[$candidate_dependency]:-}" ]] || { blocked=1; break; }
             done
             (( blocked == 0 )) || continue
+            candidate_level=0
+            for candidate_dependency in $candidate_dependencies; do
+                dependency_level="${SERVICE_LEVEL[$candidate_dependency]:-0}"
+                (( candidate_level < dependency_level + 1 )) && candidate_level=$((dependency_level + 1))
+            done
             completed["$candidate"]=1
+            SERVICE_LEVEL["$candidate"]="$candidate_level"
             SERVICE_ORDER+=("$candidate")
             progress=1
         done
@@ -543,6 +667,8 @@ validate_configuration() {
 
     yq eval '.' "$CONFIG_FILE" >/dev/null 2>&1 ||
         die "YAML is syntactically invalid: ${CONFIG_FILE}"
+
+    validate_parallel_configuration
 
     services_type="$(yaml_read '.services | type')"
     [[ "$services_type" == "!!seq" ]] || die ".services must be a YAML array."
@@ -560,6 +686,10 @@ validate_configuration() {
         enabled="$(yaml_read ".services[$index].enabled // true")"
         [[ "$enabled" == "true" || "$enabled" == "false" ]] ||
             die "Service '${name}': enabled must be true or false."
+
+        value_type="$(yaml_read ".services[$index].parallel | type")"
+        [[ "$value_type" == "!!null" || "$value_type" == "!!bool" ]] ||
+            die "Service '${name}': parallel must be true or false."
 
         validate_string ".services[$index].check.type" "Service '${name}': check.type"
         check_type="$(yaml_read ".services[$index].check.type")"
@@ -691,6 +821,22 @@ configure_runtime() {
     touch -- "$LOG_FILE" || die "Cannot write log file: ${LOG_FILE}"
     chmod 0640 "$LOG_FILE" 2>/dev/null || true
     chmod 0750 "$STATE_DIRECTORY" 2>/dev/null || true
+}
+
+configure_parallel() {
+    local value configured_directory
+    [[ "$(yaml_read '.parallel.enabled // false')" == true ]] && PARALLEL_ENABLED=1
+    value="$(yaml_read '.parallel.max_jobs // 0')"
+    PARALLEL_MAX_JOBS="$((10#$value))"
+    value="$(yaml_read '.parallel.timeout // 0')"
+    PARALLEL_TIMEOUT="$((10#$value))"
+    configured_directory="$(yaml_read '.parallel.temp_dir // ""')"
+    if [[ -n "$configured_directory" ]] && mkdir -p -- "$configured_directory" 2>/dev/null && [[ -w "$configured_directory" ]]; then
+        PARALLEL_TEMP_BASE="$configured_directory"
+    else
+        [[ -z "$configured_directory" ]] || log WARN "phase=check mode=parallel temp_dir=${configured_directory} result=fallback-to-tmp"
+        PARALLEL_TEMP_BASE="/tmp"
+    fi
 }
 
 configure_email() {
@@ -1128,7 +1274,11 @@ run_configured_sequence() {
         timeout_value="$(yaml_read "${expression}[$command_index].timeout // ${DEFAULT_ACTION_TIMEOUT}")"
         formatted="$(format_command configured_command)"
         output_file="${TEMP_DIRECTORY}/${label}-${RANDOM}.log"
-        log WARN "service=${service_name} action=${label}-command index=${command_index} command=${formatted}"
+        if (( PARALLEL_CHECK_MODE == 1 )) && [[ "$label" == check ]]; then
+            printf 'service=%s action=%s-command index=%s command=%s\n' "$service_name" "$label" "$command_index" "$formatted"
+        else
+            log WARN "service=${service_name} action=${label}-command index=${command_index} command=${formatted}"
+        fi
 
         (
             cd -- "$working_directory" || exit 125
@@ -1148,10 +1298,18 @@ run_configured_sequence() {
         rm -f -- "$output_file"
 
         if (( command_status != 0 )); then
-            log ERROR "service=${service_name} result=${label}-command-failed index=${command_index} exit=${command_status} output=${output:-none}"
+            if (( PARALLEL_CHECK_MODE == 1 )) && [[ "$label" == check ]]; then
+                printf 'service=%s result=%s-command-failed index=%s exit=%s output=%s\n' "$service_name" "$label" "$command_index" "$command_status" "${output:-none}"
+            else
+                log ERROR "service=${service_name} result=${label}-command-failed index=${command_index} exit=${command_status} output=${output:-none}"
+            fi
             return 1
         fi
-        log WARN "service=${service_name} result=${label}-command-success index=${command_index} output=${output:-none}"
+        if (( PARALLEL_CHECK_MODE == 1 )) && [[ "$label" == check ]]; then
+            printf 'service=%s result=%s-command-success index=%s output=%s\n' "$service_name" "$label" "$command_index" "${output:-none}"
+        else
+            log WARN "service=${service_name} result=${label}-command-success index=${command_index} output=${output:-none}"
+        fi
     done
     return 0
 }
@@ -1197,6 +1355,148 @@ check_with_retries() {
         fi
     done
     return 1
+}
+
+check_with_retries_parallel() {
+    local index="$1" attempts retry_delay attempt
+    attempts="$(yaml_read ".services[$index].check.attempts // ${DEFAULT_ATTEMPTS}")"
+    retry_delay="$(yaml_read ".services[$index].check.retry_delay // ${DEFAULT_RETRY_DELAY}")"
+    PARALLEL_ATTEMPTS_MADE=0
+    for ((attempt = 1; attempt <= attempts; attempt++)); do
+        PARALLEL_ATTEMPTS_MADE="$attempt"
+        printf 'service=%s action=check attempt=%s/%s type=%s\n' "$CURRENT_SERVICE" "$attempt" "$attempts" "$CURRENT_CHECK_TYPE"
+        if perform_single_check "$index"; then
+            printf 'service=%s result=check-success attempt=%s/%s detail="%s"\n' "$CURRENT_SERVICE" "$attempt" "$attempts" "$(sanitize_detail "$CHECK_DETAIL")"
+            return 0
+        fi
+        printf 'service=%s result=check-failed attempt=%s/%s detail="%s"\n' "$CURRENT_SERVICE" "$attempt" "$attempts" "$(sanitize_detail "$CHECK_DETAIL")"
+        (( attempt < attempts && retry_delay > 0 )) && sleep "$retry_delay"
+    done
+    return 1
+}
+
+parallel_timeout_for_service() {
+    local index="$1" type timeout_value
+    type="$(yaml_read ".services[$index].check.timeout | type")"
+    if [[ "$type" == "!!null" ]]; then printf '%s' "$PARALLEL_TIMEOUT"; else
+        timeout_value="$(yaml_read ".services[$index].check.timeout")"; printf '%s' "$timeout_value"
+    fi
+}
+
+write_parallel_result() {
+    local result_file="$1" state="$2" detail="$3" http_status="$4" exit_code="$5" attempts="$6" temporary detail_encoded
+    temporary="${result_file}.tmp.${BASHPID}"
+    detail_encoded="$(printf '%s' "$detail" | base64 | tr -d '\n')"
+    { printf 'state=%s\n' "$state"; printf 'detail_b64=%s\n' "$detail_encoded"; printf 'http_status=%s\n' "$http_status"; printf 'check_exit=%s\n' "$exit_code"; printf 'attempts=%s\n' "$attempts"; printf 'timestamp=%s\n' "$(date '+%s')"; } >"$temporary" && mv -f -- "$temporary" "$result_file"
+}
+
+_run_single_check_bg() {
+    local index="$1" service_name="$2" result_file="$3" log_file="$4" timeout_value worker_pid timer_pid="" check_state=unavailable
+    (
+        exec >"$log_file" 2>&1
+        CURRENT_SERVICE="$service_name"; CURRENT_CHECK_TYPE="$(yaml_read ".services[$index].check.type")"
+        CHECK_DETAIL=""; CHECK_HTTP_STATUS=""; CHECK_EXIT_CODE=""; PARALLEL_CHECK_MODE=1
+        TEMP_DIRECTORY="${TEMP_DIRECTORY}/${service_name}.${BASHPID}"
+        mkdir -p -- "$TEMP_DIRECTORY" || exit 1
+        timeout_value="$(parallel_timeout_for_service "$index")"; worker_pid="$BASHPID"
+        if (( timeout_value > 0 )); then
+            ( sleep "$timeout_value"; write_parallel_result "$result_file" unavailable "check timed out (parallel check timeout)" "" 124 "$PARALLEL_ATTEMPTS_MADE"; kill -KILL "$worker_pid" 2>/dev/null || true ) &
+            timer_pid=$!
+        fi
+        check_with_retries_parallel "$index" && check_state=healthy
+        [[ -z "$timer_pid" ]] || { kill "$timer_pid" 2>/dev/null || true; wait "$timer_pid" 2>/dev/null || true; }
+        write_parallel_result "$result_file" "$check_state" "$CHECK_DETAIL" "$CHECK_HTTP_STATUS" "$CHECK_EXIT_CODE" "$PARALLEL_ATTEMPTS_MADE"
+        rm -rf -- "$TEMP_DIRECTORY"
+    )
+}
+
+should_run_parallel() {
+    local index="$1" value value_type
+    (( PARALLEL_ENABLED == 1 )) || return 1
+    value_type="$(yaml_read ".services[$index].parallel | type")"
+    if [[ "$value_type" == "!!null" ]]; then
+        value=true
+    else
+        value="$(yaml_read ".services[$index].parallel")"
+    fi
+    [[ "$value" == true ]]
+}
+
+collect_check_results() {
+    local -n services_ref="$1"
+    local service_name result_file log_file line key value detail_encoded
+    for service_name in "${services_ref[@]}"; do
+        result_file="${TEMP_DIRECTORY}/${service_name}.result"
+        PRELOADED_CHECK_STATE["$service_name"]=unavailable; PRELOADED_CHECK_DETAIL["$service_name"]="check process did not write result"
+        PRELOADED_CHECK_HTTP_STATUS["$service_name"]=""; PRELOADED_CHECK_EXIT_CODE["$service_name"]=""; PRELOADED_CHECK_ATTEMPTS["$service_name"]=0
+        if [[ ! -r "$result_file" ]]; then log WARN "service=${service_name} phase=check mode=parallel result=missing temp_file_missing=true action=marked_unavailable"; continue; fi
+        detail_encoded=""
+        while IFS='=' read -r key value; do
+            case "$key" in state) PRELOADED_CHECK_STATE["$service_name"]="$value" ;; detail_b64) detail_encoded="$value" ;; http_status) PRELOADED_CHECK_HTTP_STATUS["$service_name"]="$value" ;; check_exit) PRELOADED_CHECK_EXIT_CODE["$service_name"]="$value" ;; attempts) PRELOADED_CHECK_ATTEMPTS["$service_name"]="$value" ;; esac
+        done <"$result_file"
+        [[ -z "$detail_encoded" ]] || PRELOADED_CHECK_DETAIL["$service_name"]="$(printf '%s' "$detail_encoded" | base64 --decode 2>/dev/null || true)"
+        [[ "${PRELOADED_CHECK_STATE[$service_name]}" == healthy || "${PRELOADED_CHECK_STATE[$service_name]}" == unavailable ]] || { PRELOADED_CHECK_STATE["$service_name"]=unavailable; PRELOADED_CHECK_DETAIL["$service_name"]="invalid parallel check result"; }
+        log INFO "service=${service_name} phase=check mode=parallel result=${PRELOADED_CHECK_STATE[$service_name]} detail=\"$(sanitize_detail "${PRELOADED_CHECK_DETAIL[$service_name]}")\""
+        log_file="${TEMP_DIRECTORY}/${service_name}.log"
+        if [[ -r "$log_file" ]]; then
+            while IFS= read -r line; do
+                log INFO "service=${service_name} phase=check mode=parallel worker_log=\"$(sanitize_detail "$line")\""
+            done <"$log_file"
+        fi
+        rm -f -- "$result_file" "$log_file"
+    done
+}
+
+run_checks_parallel() {
+    local -n services_ref="$1"
+    local service_name index result_file log_file started_ms completed_ms failed=0
+    started_ms="$(date '+%s%3N')"; log INFO "phase=check mode=parallel max_jobs=${PARALLEL_MAX_JOBS} services=${#services_ref[@]}"
+    for service_name in "${services_ref[@]}"; do
+        index="${SERVICE_INDEX[$service_name]}"
+        while (( PARALLEL_MAX_JOBS > 0 && $(jobs -pr | wc -l) >= PARALLEL_MAX_JOBS )); do wait -n 2>/dev/null || true; done
+        result_file="${TEMP_DIRECTORY}/${service_name}.result"; log_file="${TEMP_DIRECTORY}/${service_name}.log"
+        _run_single_check_bg "$index" "$service_name" "$result_file" "$log_file" &
+        log INFO "service=${service_name} phase=check mode=parallel pid=$!"
+    done
+    wait || true; collect_check_results "$1"
+    for service_name in "${services_ref[@]}"; do [[ "${PRELOADED_CHECK_STATE[$service_name]}" == healthy ]] || ((failed++)); done
+    completed_ms="$(date '+%s%3N')"; log INFO "phase=check mode=parallel completed=${#services_ref[@]} failed=${failed} duration_ms=$((completed_ms - started_ms))"
+}
+
+service_is_selected() {
+    local service_name="$1"
+    [[ -z "$ONLY_SERVICE" || "$service_name" == "$ONLY_SERVICE" ]] && return 0
+    service_is_required_for "$ONLY_SERVICE" "$service_name"
+}
+
+use_preloaded_check_result() {
+    local service_name="$1" attempts attempt
+    [[ -n "${PRELOADED_CHECK_STATE[$service_name]+present}" ]] || return 1
+    CHECK_DETAIL="${PRELOADED_CHECK_DETAIL[$service_name]}"
+    CHECK_HTTP_STATUS="${PRELOADED_CHECK_HTTP_STATUS[$service_name]}"
+    CHECK_EXIT_CODE="${PRELOADED_CHECK_EXIT_CODE[$service_name]}"
+    attempts="${PRELOADED_CHECK_ATTEMPTS[$service_name]:-0}"
+    [[ "$attempts" =~ ^[0-9]+$ ]] || attempts=0
+    for ((attempt = 0; attempt < attempts; attempt++)); do record_check_attempt "$service_name"; done
+    log INFO "service=${service_name} action=check result=${PRELOADED_CHECK_STATE[$service_name]} source=parallel detail=\"$(sanitize_detail "$CHECK_DETAIL")\""
+    [[ "${PRELOADED_CHECK_STATE[$service_name]}" == healthy ]]
+}
+
+process_parallel_level() {
+    local level="$1" service_name index enabled
+    local -a checked_services=() level_services=() sequential_checks=() parallel_checks=()
+    for service_name in "${SERVICE_ORDER[@]}"; do
+        [[ "${SERVICE_LEVEL[$service_name]}" == "$level" ]] || continue; service_is_selected "$service_name" || continue
+        level_services+=("$service_name"); index="${SERVICE_INDEX[$service_name]}"; enabled="$(yaml_read ".services[$index].enabled // true")"
+        [[ "$enabled" == true ]] || continue
+        required_dependency_is_unavailable "$service_name" >/dev/null && continue
+        checked_services+=("$service_name")
+        should_run_parallel "$index" && parallel_checks+=("$service_name") || sequential_checks+=("$service_name")
+    done
+    (( ${#parallel_checks[@]} == 0 )) || run_checks_parallel parallel_checks
+    for service_name in "${sequential_checks[@]}"; do index="${SERVICE_INDEX[$service_name]}"; _run_single_check_bg "$index" "$service_name" "${TEMP_DIRECTORY}/${service_name}.result" "${TEMP_DIRECTORY}/${service_name}.log"; done
+    (( ${#sequential_checks[@]} == 0 )) || collect_check_results sequential_checks
+    for service_name in "${level_services[@]}"; do index="${SERVICE_INDEX[$service_name]}"; process_service "$index"; RESOLVED_STATE["$service_name"]="$PROCESS_RESULT"; done
 }
 
 read_state() {
@@ -1796,7 +2096,7 @@ service_is_required_for() {
 
 process_service() {
     local index="$1"
-    local enabled actions_count verify_after circuit_state action_due=0 half_open_attempt=0
+    local enabled actions_count verify_after circuit_state action_due=0 half_open_attempt=0 initial_check_healthy=0
     CURRENT_SERVICE="$(yaml_read ".services[$index].name")"
     CURRENT_CHECK_TYPE="$(yaml_read ".services[$index].check.type")"
     CURRENT_ACTION_STATUS="not-attempted"
@@ -1822,7 +2122,12 @@ process_service() {
     fi
 
     log INFO "service=${CURRENT_SERVICE} action=service-start type=${CURRENT_CHECK_TYPE}"
-    if check_with_retries "$index"; then
+    if [[ -n "${PRELOADED_CHECK_STATE[$CURRENT_SERVICE]+present}" ]]; then
+        use_preloaded_check_result "$CURRENT_SERVICE" && initial_check_healthy=1
+    elif check_with_retries "$index"; then
+        initial_check_healthy=1
+    fi
+    if (( initial_check_healthy == 1 )); then
         CURRENT_ACTION_STATUS="not-required"
         update_maintenance_status "$CURRENT_SERVICE"
         record_circuit_action_result "$index" "$CURRENT_SERVICE" true
@@ -1937,18 +2242,27 @@ main() {
     yq_version="$(yq --version 2>/dev/null)" || die "Cannot determine yq version."
     [[ "$yq_version" =~ version[[:space:]]+v?4\. ]] || die "Mike Farah yq v4 is required: ${yq_version}"
 
+    yq eval '.' "$CONFIG_FILE" >/dev/null 2>&1 || die "YAML is syntactically invalid: ${CONFIG_FILE}"
+    validate_templates
+    expand_templates
     validate_configuration
     configure_runtime
+    configure_parallel
     configure_email
     configure_metrics
     configure_status_page
-    TEMP_DIRECTORY="$(mktemp -d)" || die "Cannot create temporary directory."
+    if (( PARALLEL_ENABLED == 1 )); then
+        TEMP_DIRECTORY="$(mktemp -d "${PARALLEL_TEMP_BASE%/}/watchdog.XXXXXX")" || die "Cannot create parallel temporary directory."
+    else
+        TEMP_DIRECTORY="$(mktemp -d)" || die "Cannot create temporary directory."
+    fi
     exec 9>"$LOCK_FILE" || die "Cannot open lock file: ${LOCK_FILE}"
     if ! flock --nonblock 9; then
         log WARN "action=lock result=already-running"
         exit 0
     fi
 
+    log_template_expansions
     log INFO "action=watchdog-start config=${CONFIG_FILE} dry_run=${DRY_RUN}"
     service_count="$(yaml_read '.services | length')"
     if [[ -n "$ONLY_SERVICE" ]]; then
@@ -1960,14 +2274,24 @@ main() {
     fi
 
     RESOLVED_STATE=()
-    for name in "${SERVICE_ORDER[@]}"; do
-        if [[ -n "$ONLY_SERVICE" && "$name" != "$ONLY_SERVICE" ]] && ! service_is_required_for "$ONLY_SERVICE" "$name"; then
-            continue
-        fi
-        index="${SERVICE_INDEX[$name]}"
-        process_service "$index"
-        RESOLVED_STATE["$name"]="$PROCESS_RESULT"
-    done
+    if (( PARALLEL_ENABLED == 1 )); then
+        local max_level=0 level
+        for name in "${SERVICE_ORDER[@]}"; do
+            (( max_level < SERVICE_LEVEL[$name] )) && max_level="${SERVICE_LEVEL[$name]}"
+        done
+        for ((level = 0; level <= max_level; level++)); do
+            process_parallel_level "$level"
+        done
+    else
+        for name in "${SERVICE_ORDER[@]}"; do
+            if [[ -n "$ONLY_SERVICE" && "$name" != "$ONLY_SERVICE" ]] && ! service_is_required_for "$ONLY_SERVICE" "$name"; then
+                continue
+            fi
+            index="${SERVICE_INDEX[$name]}"
+            process_service "$index"
+            RESOLVED_STATE["$name"]="$PROCESS_RESULT"
+        done
+    fi
 
     write_prometheus_metrics
     generate_status_page

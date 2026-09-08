@@ -9,6 +9,17 @@ settings:
   default_action_timeout: 120
   default_action_cooldown: 300
 
+# Run only health checks concurrently. State changes, remediation, hooks, and
+# notifications remain sequential, so state files and alert delivery are safe.
+parallel:
+  enabled: false
+  # 0 means unlimited. Set a limit to avoid overloading local resources.
+  max_jobs: 10
+  # Per-check fallback timeout; a service's check.timeout takes precedence.
+  timeout: 60
+  # Empty uses /tmp/watchdog. Set a writable absolute directory if needed.
+  temp_dir: ""
+
 # Optional Prometheus node_exporter textfile collector integration.
 metrics:
   enabled: false
@@ -125,22 +136,50 @@ hooks:
   on_failure: []
   on_recovery: []
 
-services:
-  - name: example-website
+# Reusable service defaults. A service's own values override template values;
+# deep merge is the default, so `check.url` below keeps all HTTP defaults.
+templates:
+  default_http:
     check:
       type: http
-      url: https://example.com/health
       method: GET
       follow_redirects: true
-      success_status:
-        - 200
+      success_status: [200]
       timeout: 10
       attempts: 2
       retry_delay: 2
-
     actions:
       cooldown: 300
       verify_after: 5
+
+  strict_tcp:
+    check:
+      type: tcp
+      timeout: 5
+      attempts: 1
+      retry_delay: 1
+    actions:
+      cooldown: 60
+      verify_after: 3
+
+  service_command:
+    check:
+      type: command
+      attempts: 1
+      retry_delay: 0
+    actions:
+      cooldown: 300
+      verify_after: 2
+
+services:
+  - name: example-website
+    template: default_http
+    # Set false to keep this individual check out of a parallel batch.
+    parallel: false
+    check:
+      url: https://example.com/health
+
+    actions:
       commands:
         - command:
             - docker
@@ -169,14 +208,12 @@ services:
         required: true
 
   - name: local-postgresql
+    template: strict_tcp
     check:
-      type: tcp
       host: 127.0.0.1
       port: 5432
 
     actions:
-      cooldown: 300
-      verify_after: 3
       commands:
         - command:
             - systemctl
@@ -184,9 +221,8 @@ services:
             - postgresql
 
   - name: background-worker
+    template: service_command
     check:
-      type: command
-      attempts: 1
       commands:
         - command:
             - systemctl
@@ -194,8 +230,6 @@ services:
             - --quiet
             - example-worker
     actions:
-      cooldown: 300
-      verify_after: 2
       commands:
         - command:
             - systemctl
@@ -237,8 +271,8 @@ services:
             timeout: 30
 
   - name: public-frontend
+    template: default_http
     check:
-      type: http
       url: https://example.com
     depends_on:
       - name: example-website
