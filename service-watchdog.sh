@@ -61,6 +61,8 @@ declare -A PRELOADED_CHECK_DETAIL=()
 declare -A PRELOADED_CHECK_HTTP_STATUS=()
 declare -A PRELOADED_CHECK_EXIT_CODE=()
 declare -A PRELOADED_CHECK_ATTEMPTS=()
+declare -A CONDITION_SKIPPED=()
+declare -A CONDITION_EVALUATED=()
 SERVICE_ORDER=()
 TEMPLATE_EXPANSION_LOG=()
 TEMPLATE_WARNING_LOG=()
@@ -81,6 +83,8 @@ EMAIL_RECOVERY_BODY=""
 
 ACTION_ATTEMPTED=0
 UNHEALTHY_FOUND=0
+CONDITION_DETAIL=""
+CONDITION_ERROR=0
 
 usage() {
     cat <<EOF
@@ -231,6 +235,10 @@ is_positive_integer() {
 
 is_non_negative_integer() {
     [[ "$1" =~ ^[0-9]+$ ]]
+}
+
+is_non_negative_number() {
+    [[ "$1" =~ ^([0-9]+([.][0-9]*)?|[.][0-9]+)$ ]]
 }
 
 validate_string() {
@@ -478,6 +486,124 @@ validate_maintenance_configuration() {
                 die "Service '${service_name}': invalid maintenance day '${day}'." ;;
             esac
         done
+    done
+}
+
+validate_only_if_configuration() {
+    local index="$1" service_name="$2" conditions_type condition_count condition type value value_type
+    local argument_count argument_index exit_count exit_index days time start end day normalized_day timezone
+    local threshold_count
+    local -a condition_days=()
+
+    conditions_type="$(yaml_read ".services[$index].only_if | type")"
+    [[ "$conditions_type" == "!!null" ]] && return 0
+    [[ "$conditions_type" == "!!seq" ]] || die "Service '${service_name}': only_if must be a YAML array."
+    condition_count="$(yaml_read ".services[$index].only_if | length")"
+    for ((condition = 0; condition < condition_count; condition++)); do
+        validate_string ".services[$index].only_if[$condition].type" "Service '${service_name}': only_if[$condition].type"
+        type="$(yaml_read ".services[$index].only_if[$condition].type")"
+        value="$(yaml_read ".services[$index].only_if[$condition].invert // false")"
+        [[ "$value" == true || "$value" == false ]] || die "Service '${service_name}': only_if[$condition].invert must be true or false."
+        case "$type" in
+            command)
+                value_type="$(yaml_read ".services[$index].only_if[$condition].command | type")"
+                [[ "$value_type" == "!!seq" ]] || die "Service '${service_name}': only_if[$condition].command must be an array."
+                argument_count="$(yaml_read ".services[$index].only_if[$condition].command | length")"
+                (( argument_count > 0 )) || die "Service '${service_name}': only_if[$condition].command must not be empty."
+                for ((argument_index = 0; argument_index < argument_count; argument_index++)); do
+                    value_type="$(yaml_read ".services[$index].only_if[$condition].command[$argument_index] | type")"
+                    case "$value_type" in "!!str"|"!!int"|"!!float"|"!!bool") ;; *)
+                        die "Service '${service_name}': only_if[$condition].command[$argument_index] must be scalar." ;;
+                    esac
+                done
+                value="$(yaml_read ".services[$index].only_if[$condition].timeout // 10")"
+                is_positive_integer "$value" || die "Service '${service_name}': only_if[$condition].timeout must be a positive integer."
+                value_type="$(yaml_read ".services[$index].only_if[$condition].exit_code | type")"
+                case "$value_type" in
+                    "!!null") ;;
+                    "!!int")
+                        value="$(yaml_read ".services[$index].only_if[$condition].exit_code")"
+                        if ! is_non_negative_integer "$value" || (( 10#$value > 255 )); then
+                            die "Service '${service_name}': only_if[$condition].exit_code must be from 0 through 255."
+                        fi
+                        ;;
+                    "!!seq")
+                        exit_count="$(yaml_read ".services[$index].only_if[$condition].exit_code | length")"
+                        (( exit_count > 0 )) || die "Service '${service_name}': only_if[$condition].exit_code must not be empty."
+                        for ((exit_index = 0; exit_index < exit_count; exit_index++)); do
+                            value_type="$(yaml_read ".services[$index].only_if[$condition].exit_code[$exit_index] | type")"
+                            [[ "$value_type" == "!!int" ]] || die "Service '${service_name}': only_if[$condition].exit_code[$exit_index] must be an integer."
+                            value="$(yaml_read ".services[$index].only_if[$condition].exit_code[$exit_index]")"
+                            if ! is_non_negative_integer "$value" || (( 10#$value > 255 )); then
+                                die "Service '${service_name}': only_if[$condition].exit_code[$exit_index] must be from 0 through 255."
+                            fi
+                        done
+                        ;;
+                    *) die "Service '${service_name}': only_if[$condition].exit_code must be an integer or array." ;;
+                esac
+                ;;
+            file_exists)
+                validate_string ".services[$index].only_if[$condition].path" "Service '${service_name}': only_if[$condition].path"
+                value="$(yaml_read ".services[$index].only_if[$condition].path")"
+                [[ "$value" == /* ]] || die "Service '${service_name}': only_if[$condition].path must be absolute."
+                ;;
+            time_window)
+                validate_string ".services[$index].only_if[$condition].days" "Service '${service_name}': only_if[$condition].days"
+                validate_string ".services[$index].only_if[$condition].time" "Service '${service_name}': only_if[$condition].time"
+                days="$(yaml_read ".services[$index].only_if[$condition].days")"
+                time="$(yaml_read ".services[$index].only_if[$condition].time")"
+                [[ "$time" =~ ^[0-9]{2}:[0-9]{2}-[0-9]{2}:[0-9]{2}$ ]] || die "Service '${service_name}': only_if[$condition].time must use HH:MM-HH:MM."
+                start="${time%-*}"; end="${time#*-}"
+                [[ "${start%:*}" =~ ^(0[0-9]|1[0-9]|2[0-3])$ && "${start#*:}" =~ ^[0-5][0-9]$ && "${end%:*}" =~ ^(0[0-9]|1[0-9]|2[0-3])$ && "${end#*:}" =~ ^[0-5][0-9]$ && "$start" < "$end" ]] || die "Service '${service_name}': only_if[$condition].time must be a same-day interval with start before end."
+                [[ -n "$days" ]] || die "Service '${service_name}': only_if[$condition].days must not be empty."
+                if [[ "$days" != "*" ]]; then
+                    IFS=',' read -r -a condition_days <<<"$days"
+                    for day in "${condition_days[@]}"; do
+                        normalized_day="${day,,}"
+                        case "$normalized_day" in mon|tue|wed|thu|fri|sat|sun) ;; *) die "Service '${service_name}': invalid only_if day '${day}'." ;; esac
+                    done
+                fi
+                value_type="$(yaml_read ".services[$index].only_if[$condition].timezone | type")"
+                if [[ "$value_type" != "!!null" ]]; then
+                    validate_string ".services[$index].only_if[$condition].timezone" "Service '${service_name}': only_if[$condition].timezone"
+                    timezone="$(yaml_read ".services[$index].only_if[$condition].timezone")"
+                    [[ "$timezone" != *[[:space:]]* ]] || die "Service '${service_name}': only_if[$condition].timezone must not contain spaces."
+                    TZ="$timezone" date '+%H:%M' >/dev/null 2>&1 || die "Service '${service_name}': only_if[$condition].timezone is invalid: ${timezone}"
+                    [[ "$timezone" == UTC || -r "/usr/share/zoneinfo/${timezone}" ]] || die "Service '${service_name}': only_if[$condition].timezone is not an installed IANA time zone: ${timezone}"
+                fi
+                ;;
+            load_average)
+                threshold_count=0
+                for value in max_1min max_5min max_15min; do
+                    value_type="$(yaml_read ".services[$index].only_if[$condition].${value} | type")"
+                    [[ "$value_type" == "!!null" ]] && continue
+                    [[ "$value_type" == "!!int" || "$value_type" == "!!float" ]] || die "Service '${service_name}': only_if[$condition].${value} must be a number."
+                    type="$(yaml_read ".services[$index].only_if[$condition].${value}")"
+                    is_non_negative_number "$type" || die "Service '${service_name}': only_if[$condition].${value} must be non-negative."
+                    ((threshold_count++))
+                done
+                (( threshold_count > 0 )) || die "Service '${service_name}': only_if[$condition].load_average needs at least one maximum."
+                ;;
+            filesystem)
+                validate_string ".services[$index].only_if[$condition].path" "Service '${service_name}': only_if[$condition].path"
+                value="$(yaml_read ".services[$index].only_if[$condition].path")"
+                [[ "$value" == /* ]] || die "Service '${service_name}': only_if[$condition].path must be absolute."
+                threshold_count=0
+                for value in min_free_gb min_free_percent; do
+                    value_type="$(yaml_read ".services[$index].only_if[$condition].${value} | type")"
+                    [[ "$value_type" == "!!null" ]] && continue
+                    [[ "$value_type" == "!!int" || "$value_type" == "!!float" ]] || die "Service '${service_name}': only_if[$condition].${value} must be a number."
+                    type="$(yaml_read ".services[$index].only_if[$condition].${value}")"
+                    is_non_negative_number "$type" || die "Service '${service_name}': only_if[$condition].${value} must be non-negative."
+                    if [[ "$value" == min_free_percent ]] && ! awk -v threshold="$type" 'BEGIN { exit !(threshold <= 100) }'; then
+                        die "Service '${service_name}': only_if[$condition].min_free_percent must not exceed 100."
+                    fi
+                    ((threshold_count++))
+                done
+                (( threshold_count > 0 )) || die "Service '${service_name}': only_if[$condition].filesystem needs min_free_gb or min_free_percent."
+                ;;
+            *) die "Service '${service_name}': only_if[$condition].type must be command, file_exists, time_window, load_average, or filesystem." ;;
+        esac
     done
 }
 
@@ -764,6 +890,7 @@ validate_configuration() {
         value="$(yaml_read ".services[$index].actions.verify_after // 0")"
         is_non_negative_integer "$value" ||
             die "Service '${name}': actions.verify_after must be a non-negative integer."
+        validate_only_if_configuration "$index" "$name"
         validate_maintenance_configuration "$index" "$name"
         validate_escalation_configuration "$index" "$name"
         validate_circuit_breaker_configuration "$index" "$name"
@@ -920,6 +1047,188 @@ format_command() {
 
 sanitize_detail() {
     printf '%s' "$1" | tail -c 4096 | tr '\r\n' '  '
+}
+
+apply_condition_invert() {
+    local index="$1" condition="$2" raw_result="$3" invert
+    invert="$(yaml_read ".services[$index].only_if[$condition].invert // false")"
+    if [[ "$invert" == true ]]; then
+        CONDITION_DETAIL+=" invert=true"
+        if (( raw_result == 0 )); then
+            return 1
+        fi
+        return 0
+    fi
+    return "$raw_result"
+}
+
+condition_expected_exit_matches() {
+    local index="$1" condition="$2" exit_code="$3" value_type expected count item
+    value_type="$(yaml_read ".services[$index].only_if[$condition].exit_code | type")"
+    if [[ "$value_type" == "!!null" ]]; then
+        [[ "$exit_code" == 0 ]]
+        return
+    fi
+    if [[ "$value_type" == "!!int" ]]; then
+        expected="$(yaml_read ".services[$index].only_if[$condition].exit_code")"
+        [[ "$exit_code" == "$expected" ]]
+        return
+    fi
+    count="$(yaml_read ".services[$index].only_if[$condition].exit_code | length")"
+    for ((item = 0; item < count; item++)); do
+        expected="$(yaml_read ".services[$index].only_if[$condition].exit_code[$item]")"
+        [[ "$exit_code" == "$expected" ]] && return 0
+    done
+    return 1
+}
+
+condition_expected_exit_description() {
+    local index="$1" condition="$2" value_type count item result=""
+    value_type="$(yaml_read ".services[$index].only_if[$condition].exit_code | type")"
+    [[ "$value_type" == "!!null" ]] && { printf '0'; return; }
+    [[ "$value_type" == "!!int" ]] && { yaml_read ".services[$index].only_if[$condition].exit_code"; return; }
+    count="$(yaml_read ".services[$index].only_if[$condition].exit_code | length")"
+    for ((item = 0; item < count; item++)); do
+        if [[ -n "$result" ]]; then
+            result+=","
+        fi
+        result+="$(yaml_read ".services[$index].only_if[$condition].exit_code[$item]")"
+    done
+    printf '[%s]' "$result"
+}
+
+evaluate_single_condition() {
+    local index="$1" condition="$2" type raw_result=1 timeout_value command_status formatted
+    local path days time timezone day now start end normalized_day matched_day
+    local load_1 load_5 load_15 field threshold current value_type
+    local free_bytes free_percent df_values min_free_gb min_free_percent
+    local -a condition_command=() condition_days=()
+
+    CONDITION_DETAIL=""
+    CONDITION_ERROR=0
+    type="$(yaml_read ".services[$index].only_if[$condition].type")"
+    case "$type" in
+        command)
+            load_command ".services[$index].only_if[$condition].command" condition_command
+            formatted="$(format_command condition_command)"
+            timeout_value="$(yaml_read ".services[$index].only_if[$condition].timeout // 10")"
+            timeout --signal=TERM --kill-after=2s "$timeout_value" "${condition_command[@]}" >/dev/null 2>&1
+            command_status=$?
+            if (( command_status == 124 || command_status == 137 )); then
+                CONDITION_ERROR=1
+                CONDITION_DETAIL="command ${formatted} reason=timeout"
+            else
+                CONDITION_DETAIL="command ${formatted} exit=${command_status} expected=$(condition_expected_exit_description "$index" "$condition")"
+                condition_expected_exit_matches "$index" "$condition" "$command_status" && raw_result=0
+            fi
+            ;;
+        file_exists)
+            path="$(yaml_read ".services[$index].only_if[$condition].path")"
+            CONDITION_DETAIL="file_exists path=${path}"
+            [[ -e "$path" ]] && raw_result=0
+            ;;
+        time_window)
+            days="$(yaml_read ".services[$index].only_if[$condition].days")"
+            time="$(yaml_read ".services[$index].only_if[$condition].time")"
+            timezone="$(yaml_read ".services[$index].only_if[$condition].timezone // \"\"")"
+            if [[ -n "$timezone" ]]; then
+                day="$(TZ="$timezone" LC_ALL=C date '+%a')"
+                now="$(TZ="$timezone" date '+%H:%M')"
+            else
+                day="$(LC_ALL=C date '+%a')"
+                now="$(date '+%H:%M')"
+            fi
+            day="${day,,}"
+            matched_day=0
+            if [[ "$days" == "*" ]]; then
+                matched_day=1
+            else
+                IFS=',' read -r -a condition_days <<<"$days"
+                for normalized_day in "${condition_days[@]}"; do
+                    [[ "${normalized_day,,}" == "$day" ]] && matched_day=1
+                done
+            fi
+            start="${time%-*}"; end="${time#*-}"
+            CONDITION_DETAIL="time_window days=${days} time=${time} current=${day}_${now}${timezone:+ timezone=${timezone}}"
+            if (( matched_day == 1 )) && [[ "$now" > "$start" || "$now" == "$start" ]] && [[ "$now" < "$end" ]]; then
+                raw_result=0
+            fi
+            ;;
+        load_average)
+            if [[ ! -r /proc/loadavg ]] || ! read -r load_1 load_5 load_15 _ </proc/loadavg; then
+                CONDITION_ERROR=1
+                CONDITION_DETAIL="load_average reason=unavailable"
+                apply_condition_invert "$index" "$condition" "$raw_result"
+                return
+            fi
+            raw_result=0
+            for field in max_1min max_5min max_15min; do
+                value_type="$(yaml_read ".services[$index].only_if[$condition].${field} | type")"
+                [[ "$value_type" == "!!null" ]] && continue
+                threshold="$(yaml_read ".services[$index].only_if[$condition].${field}")"
+                case "$field" in max_1min) current="$load_1" ;; max_5min) current="$load_5" ;; *) current="$load_15" ;; esac
+                if ! awk -v current="$current" -v maximum="$threshold" 'BEGIN { exit !(current <= maximum) }'; then
+                    raw_result=1
+                    CONDITION_DETAIL="load_average ${field}=${threshold} current=${current}"
+                    break
+                fi
+                CONDITION_DETAIL="load_average ${field}=${threshold} current=${current}"
+            done
+            ;;
+        filesystem)
+            path="$(yaml_read ".services[$index].only_if[$condition].path")"
+            df_values="$(df -B1 --output=avail,pcent -- "$path" 2>/dev/null | awk 'NR == 2 { gsub(/%/, "", $2); print $1, $2 }')"
+            read -r free_bytes free_percent <<<"$df_values"
+            if ! [[ "$free_bytes" =~ ^[0-9]+$ && "$free_percent" =~ ^[0-9]+$ ]]; then
+                CONDITION_ERROR=1
+                CONDITION_DETAIL="filesystem path=${path} reason=unavailable"
+                apply_condition_invert "$index" "$condition" "$raw_result"
+                return
+            fi
+            raw_result=0
+            value_type="$(yaml_read ".services[$index].only_if[$condition].min_free_gb | type")"
+            if [[ "$value_type" != "!!null" ]]; then
+                min_free_gb="$(yaml_read ".services[$index].only_if[$condition].min_free_gb")"
+                if ! awk -v bytes="$free_bytes" -v minimum="$min_free_gb" 'BEGIN { exit !(bytes >= minimum * 1024 * 1024 * 1024) }'; then
+                    raw_result=1
+                    CONDITION_DETAIL="filesystem path=${path} min_free_gb=${min_free_gb} current_free_gb=$(awk -v bytes="$free_bytes" 'BEGIN { printf "%.2f", bytes / 1024 / 1024 / 1024 }')"
+                fi
+            fi
+            value_type="$(yaml_read ".services[$index].only_if[$condition].min_free_percent | type")"
+            if [[ "$value_type" != "!!null" ]] && (( raw_result == 0 )); then
+                min_free_percent="$(yaml_read ".services[$index].only_if[$condition].min_free_percent")"
+                if ! awk -v percent="$free_percent" -v minimum="$min_free_percent" 'BEGIN { exit !(percent >= minimum) }'; then
+                    raw_result=1
+                    CONDITION_DETAIL="filesystem path=${path} min_free_percent=${min_free_percent} current_free_percent=${free_percent}"
+                fi
+            fi
+            [[ -n "$CONDITION_DETAIL" ]] || CONDITION_DETAIL="filesystem path=${path} current_free_percent=${free_percent}"
+            ;;
+        *)
+            CONDITION_ERROR=1
+            CONDITION_DETAIL="condition type=${type} reason=unsupported"
+            ;;
+    esac
+    apply_condition_invert "$index" "$condition" "$raw_result"
+}
+
+evaluate_conditions() {
+    local index="$1" service_name="$2" count condition
+    count="$(yaml_read ".services[$index].only_if // [] | length")"
+    (( count > 0 )) || return 0
+    for ((condition = 0; condition < count; condition++)); do
+        if evaluate_single_condition "$index" "$condition"; then
+            continue
+        fi
+        if (( CONDITION_ERROR == 1 )); then
+            log WARN "service=${service_name} only_if=error condition=\"$(sanitize_detail "$CONDITION_DETAIL")\" condition_index=$((condition + 1)) action=skipped"
+        else
+            log INFO "service=${service_name} only_if=false condition=\"$(sanitize_detail "$CONDITION_DETAIL")\" condition_index=$((condition + 1)) action=skipped"
+        fi
+        return 1
+    done
+    log INFO "service=${service_name} only_if=true conditions=${count}"
+    return 0
 }
 
 render_email_template() {
@@ -1492,6 +1801,11 @@ process_parallel_level() {
         level_services+=("$service_name"); index="${SERVICE_INDEX[$service_name]}"; enabled="$(yaml_read ".services[$index].enabled // true")"
         [[ "$enabled" == true ]] || continue
         required_dependency_is_unavailable "$service_name" >/dev/null && continue
+        if ! evaluate_conditions "$index" "$service_name"; then
+            CONDITION_SKIPPED["$service_name"]=1
+            continue
+        fi
+        CONDITION_EVALUATED["$service_name"]=1
         checked_services+=("$service_name")
         should_run_parallel "$index" && parallel_checks+=("$service_name") || sequential_checks+=("$service_name")
     done
@@ -2123,6 +2437,15 @@ process_service() {
         return 0
     fi
 
+    if [[ -n "${CONDITION_SKIPPED[$CURRENT_SERVICE]+present}" ]]; then
+        PROCESS_RESULT="$(read_state "$CURRENT_SERVICE")"
+        return 0
+    fi
+    if [[ -z "${CONDITION_EVALUATED[$CURRENT_SERVICE]+present}" ]] && ! evaluate_conditions "$index" "$CURRENT_SERVICE"; then
+        PROCESS_RESULT="$(read_state "$CURRENT_SERVICE")"
+        return 0
+    fi
+
     log INFO "service=${CURRENT_SERVICE} action=service-start type=${CURRENT_CHECK_TYPE}"
     if [[ -n "${PRELOADED_CHECK_STATE[$CURRENT_SERVICE]+present}" ]]; then
         use_preloaded_check_result "$CURRENT_SERVICE" && initial_check_healthy=1
@@ -2238,7 +2561,7 @@ main() {
     done
 
     [[ -f "$CONFIG_FILE" ]] || die "Configuration file not found: ${CONFIG_FILE}"
-    for name in bash base64 curl yq flock timeout date dirname mktemp tail tr mv env; do
+    for name in bash base64 curl yq flock timeout date dirname mktemp tail tr mv env awk df; do
         require_command "$name"
     done
     yq_version="$(yq --version 2>/dev/null)" || die "Cannot determine yq version."
@@ -2276,6 +2599,8 @@ main() {
     fi
 
     RESOLVED_STATE=()
+    CONDITION_SKIPPED=()
+    CONDITION_EVALUATED=()
     if (( PARALLEL_ENABLED == 1 )); then
         local max_level=0 level
         for name in "${SERVICE_ORDER[@]}"; do

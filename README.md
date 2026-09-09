@@ -567,6 +567,63 @@ HTTP type, timeout, or attempts. Template names must be unique simple names,
 and templates cannot inherit from other templates. `name`, `template`, and
 `template_mode` inside a template are ignored with a warning.
 
+### Conditional Checks
+
+Use `only_if` to gate an entire service run. Every listed condition must pass;
+if one does not, Watchdog skips the health check, remediation, hooks, and
+notifications. The service's state is not changed, so it remains at its last
+known value until a later run meets the conditions.
+
+| Type | Required fields | Passes when |
+| --- | --- | --- |
+| `command` | `command` array | Its exit code matches `exit_code` (default `0`) |
+| `file_exists` | absolute `path` | The file or directory exists |
+| `time_window` | `days`, `time` | Current time is inside the configured window |
+| `load_average` | one or more `max_*min` values | Load is at or below every supplied maximum |
+| `filesystem` | absolute `path`, free-space threshold | The filesystem has sufficient free space |
+
+Set `invert: true` on an individual condition to reverse its result. This is
+useful for backup marker files and for checks that should run outside a time
+window.
+
+```yaml
+services:
+  - name: staging-api
+    check: { type: http, url: https://staging.example.com/health }
+    only_if:
+      # Run only outside Moscow working hours.
+      - type: time_window
+        days: "Mon,Tue,Wed,Thu,Fri"
+        time: "09:00-18:00"
+        timezone: Europe/Moscow
+        invert: true
+
+  - name: api
+    check: { type: http, url: https://api.example.com/health }
+    only_if:
+      # Do not restart a service if the host is overloaded.
+      - type: load_average
+        max_1min: 4.0
+      # Do not check while a backup is in progress.
+      - type: file_exists
+        path: /var/run/backup-in-progress
+        invert: true
+```
+
+Command conditions are executed directly, without `eval`, and support a
+per-condition timeout and one or more accepted exit codes:
+
+```yaml
+only_if:
+  - type: command
+    command: [test, -f, /var/run/allow-external-check]
+    timeout: 5
+    exit_code: [0]
+  - type: filesystem
+    path: /
+    min_free_gb: 5.0
+```
+
 ### Dependency Chains
 
 Declare service dependencies to prevent alert storms and pointless downstream

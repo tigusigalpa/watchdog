@@ -179,6 +179,12 @@ services:
     check:
       url: https://example.com/health
 
+    # Do not check or restart while a backup marker is present.
+    only_if:
+      - type: file_exists
+        path: /var/run/backup-in-progress
+        invert: true
+
     actions:
       commands:
         - command:
@@ -213,6 +219,11 @@ services:
       host: 127.0.0.1
       port: 5432
 
+    # Avoid remediation while the host is already under high load.
+    only_if:
+      - type: load_average
+        max_1min: 4.0
+
     actions:
       commands:
         - command:
@@ -229,6 +240,12 @@ services:
             - is-active
             - --quiet
             - example-worker
+
+    # A command condition can combine any local policy checks.
+    only_if:
+      - type: command
+        command: [test, -f, /var/run/allow-worker-check]
+        timeout: 5
     actions:
       commands:
         - command:
@@ -279,3 +296,15 @@ services:
         required: true
       - name: local-postgresql
         required: false
+
+  - name: staging-api
+    template: default_http
+    check:
+      url: https://staging.example.com/health
+    # Check staging outside Moscow business hours only.
+    only_if:
+      - type: time_window
+        days: "Mon,Tue,Wed,Thu,Fri"
+        time: "09:00-18:00"
+        timezone: Europe/Moscow
+        invert: true
