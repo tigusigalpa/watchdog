@@ -44,6 +44,25 @@ STATUS_PAGE_ENABLED=0
 STATUS_PAGE_DIRECTORY=""
 STATUS_PAGE_HTML_FILENAME="index.html"
 STATUS_PAGE_JSON_FILENAME=""
+FEDERATION_ENABLED=0
+FEDERATION_AGENT_ENABLED=0
+FEDERATION_HUB_ENABLED=0
+FEDERATION_NODE_ID=""
+FEDERATION_AGENT_TRANSPORT=""
+FEDERATION_AGENT_HUB_URL=""
+FEDERATION_AGENT_TOKEN_ENV=""
+FEDERATION_AGENT_TIMEOUT=10
+FEDERATION_AGENT_REPORT_PATH=""
+FEDERATION_AGENT_HEARTBEAT=1
+FEDERATION_HUB_INCOMING_DIRECTORY=""
+FEDERATION_HUB_ARCHIVE_DIRECTORY=""
+FEDERATION_HUB_MAX_REPORT_AGE=300
+FEDERATION_HUB_ARCHIVE_RETENTION_DAYS=0
+FEDERATION_HUB_STATE_FILE=""
+FEDERATION_HUB_OVERALL_STATUS="unknown"
+FEDERATION_HUB_UNHEALTHY_SERVICES=""
+FEDERATION_HUB_OFFLINE_NODES=""
+FEDERATION_STATE_CHANGED=0
 PARALLEL_ENABLED=0
 PARALLEL_MAX_JOBS=0
 PARALLEL_TIMEOUT=0
@@ -728,6 +747,96 @@ validate_parallel_configuration() {
     fi
 }
 
+federation_validate_config() {
+    local type enabled value value_type count index node_id
+    local -A seen_nodes=()
+
+    type="$(yaml_read '.federation | type')"
+    [[ "$type" == "!!null" ]] && return 0
+    [[ "$type" == "!!map" ]] || die "federation must be a YAML map."
+    enabled="$(yaml_read '.federation.enabled // false')"
+    [[ "$enabled" == true || "$enabled" == false ]] || die "federation.enabled must be true or false."
+    [[ "$enabled" == true ]] || return 0
+
+    value_type="$(yaml_read '.federation.node_id | type')"
+    [[ "$value_type" == "!!null" || "$value_type" == "!!str" ]] || die "federation.node_id must be a string."
+    if [[ "$value_type" == "!!str" ]]; then
+        node_id="$(yaml_read '.federation.node_id')"
+        [[ "$node_id" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die "federation.node_id contains unsupported characters."
+    fi
+
+    for type in agent hub; do
+        value_type="$(yaml_read ".federation.${type} | type")"
+        [[ "$value_type" == "!!null" || "$value_type" == "!!map" ]] || die "federation.${type} must be a YAML map."
+        value="$(yaml_read ".federation.${type}.enabled // false")"
+        [[ "$value" == true || "$value" == false ]] || die "federation.${type}.enabled must be true or false."
+    done
+
+    enabled="$(yaml_read '.federation.agent.enabled // false')"
+    if [[ "$enabled" == true ]]; then
+        value="$(yaml_read '.federation.agent.transport // "http"')"
+        [[ "$value" == http || "$value" == file ]] || die "federation.agent.transport must be http or file."
+        value="$(yaml_read '.federation.agent.timeout // 10')"
+        is_positive_integer "$value" || die "federation.agent.timeout must be a positive integer."
+        value="$(yaml_read '.federation.agent.heartbeat // true')"
+        [[ "$value" == true || "$value" == false ]] || die "federation.agent.heartbeat must be true or false."
+        if [[ "$(yaml_read '.federation.agent.transport // "http"')" == http ]]; then
+            validate_string '.federation.agent.hub_url' 'federation.agent.hub_url'
+            value="$(yaml_read '.federation.agent.hub_url')"
+            [[ "$value" =~ ^https?://[^[:space:]]+$ ]] || die "federation.agent.hub_url must be an HTTP(S) URL without spaces."
+            validate_string '.federation.agent.token_env' 'federation.agent.token_env'
+            value="$(yaml_read '.federation.agent.token_env')"
+            [[ "$value" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || die "federation.agent.token_env is not a valid environment variable name."
+        else
+            validate_string '.federation.agent.report_path' 'federation.agent.report_path'
+            value="$(yaml_read '.federation.agent.report_path')"
+            [[ "$value" == /* ]] || die "federation.agent.report_path must be an absolute path."
+        fi
+    fi
+
+    enabled="$(yaml_read '.federation.hub.enabled // false')"
+    if [[ "$enabled" == true ]]; then
+        for value in incoming_dir archive_dir; do
+            validate_string ".federation.hub.${value}" "federation.hub.${value}"
+            node_id="$(yaml_read ".federation.hub.${value}")"
+            [[ "$node_id" == /* ]] || die "federation.hub.${value} must be an absolute path."
+        done
+        value="$(yaml_read '.federation.hub.max_report_age // 300')"
+        is_positive_integer "$value" || die "federation.hub.max_report_age must be a positive integer."
+        value="$(yaml_read '.federation.hub.archive_retention_days // 0')"
+        is_non_negative_integer "$value" || die "federation.hub.archive_retention_days must be a non-negative integer."
+        value_type="$(yaml_read '.federation.hub.expected_nodes | type')"
+        [[ "$value_type" == "!!null" || "$value_type" == "!!seq" ]] || die "federation.hub.expected_nodes must be a YAML array."
+        if [[ "$value_type" == "!!seq" ]]; then
+            count="$(yaml_read '.federation.hub.expected_nodes | length')"
+            for ((index = 0; index < count; index++)); do
+                validate_string ".federation.hub.expected_nodes[$index]" "federation.hub.expected_nodes[$index]"
+                node_id="$(yaml_read ".federation.hub.expected_nodes[$index]")"
+                [[ "$node_id" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die "Invalid federation expected node: ${node_id}"
+                [[ -z "${seen_nodes[$node_id]:-}" ]] || die "Duplicate federation expected node: ${node_id}"
+                seen_nodes["$node_id"]=1
+            done
+        fi
+        for value in overall_change agent_offline any_service_change; do
+            node_id="$(yaml_read ".federation.hub.notify_on.${value} // true")"
+            [[ "$node_id" == true || "$node_id" == false ]] || die "federation.hub.notify_on.${value} must be true or false."
+        done
+        value_type="$(yaml_read '.federation.hub.templates | type')"
+        [[ "$value_type" == "!!null" || "$value_type" == "!!map" ]] || die "federation.hub.templates must be a YAML map."
+        for type in overall_failure overall_recovery agent_offline; do
+            value_type="$(yaml_read ".federation.hub.templates.${type} | type")"
+            [[ "$value_type" == "!!null" || "$value_type" == "!!map" ]] || die "federation.hub.templates.${type} must be a YAML map."
+            for value in subject body; do
+                value_type="$(yaml_read ".federation.hub.templates.${type}.${value} | type")"
+                [[ "$value_type" == "!!null" || "$value_type" == "!!str" ]] || die "federation.hub.templates.${type}.${value} must be a string."
+            done
+        done
+    fi
+
+    [[ "$(yaml_read '.federation.agent.enabled // false')" == true && "$(yaml_read '.federation.hub.enabled // false')" == true ]] &&
+        die "federation.agent and federation.hub must use separate watchdog instances."
+}
+
 build_dependency_graph() {
     local service_count index service_name dependencies_type dependency_count dependency dependency_name required
     local candidate candidate_dependencies candidate_dependency progress blocked
@@ -795,11 +904,14 @@ validate_configuration() {
         die "YAML is syntactically invalid: ${CONFIG_FILE}"
 
     validate_parallel_configuration
+    federation_validate_config
 
     services_type="$(yaml_read '.services | type')"
     [[ "$services_type" == "!!seq" ]] || die ".services must be a YAML array."
     service_count="$(yaml_read '.services | length')"
-    (( service_count > 0 )) || die ".services must contain at least one service."
+    if (( service_count == 0 )) && [[ "$(yaml_read '.federation.hub.enabled // false')" != true ]]; then
+        die ".services must contain at least one service."
+    fi
 
     for ((index = 0; index < service_count; index++)); do
         validate_string ".services[$index].name" ".services[$index].name"
@@ -1020,6 +1132,41 @@ configure_status_page() {
     STATUS_PAGE_DIRECTORY="$(yaml_read '.status_page.output_directory')"
     STATUS_PAGE_HTML_FILENAME="$(yaml_read '.status_page.html_filename // "index.html"')"
     STATUS_PAGE_JSON_FILENAME="$(yaml_read '.status_page.json_filename // ""')"
+}
+
+configure_federation() {
+    local value
+
+    [[ "$(yaml_read '.federation.enabled // false')" == true ]] || return 0
+    FEDERATION_ENABLED=1
+    FEDERATION_NODE_ID="$(yaml_read '.federation.node_id // ""')"
+    [[ -n "$FEDERATION_NODE_ID" ]] || FEDERATION_NODE_ID="$(hostname -s)"
+
+    if [[ "$(yaml_read '.federation.agent.enabled // false')" == true ]]; then
+        FEDERATION_AGENT_ENABLED=1
+        FEDERATION_AGENT_TRANSPORT="$(yaml_read '.federation.agent.transport // "http"')"
+        FEDERATION_AGENT_HUB_URL="$(yaml_read '.federation.agent.hub_url // ""')"
+        FEDERATION_AGENT_TOKEN_ENV="$(yaml_read '.federation.agent.token_env // ""')"
+        value="$(yaml_read '.federation.agent.timeout // 10')"
+        FEDERATION_AGENT_TIMEOUT="$((10#$value))"
+        FEDERATION_AGENT_REPORT_PATH="$(yaml_read '.federation.agent.report_path // ""')"
+        if [[ "$(yaml_read '.federation.agent.heartbeat // true')" == true ]]; then
+            FEDERATION_AGENT_HEARTBEAT=1
+        else
+            FEDERATION_AGENT_HEARTBEAT=0
+        fi
+    fi
+
+    if [[ "$(yaml_read '.federation.hub.enabled // false')" == true ]]; then
+        FEDERATION_HUB_ENABLED=1
+        FEDERATION_HUB_INCOMING_DIRECTORY="$(yaml_read '.federation.hub.incoming_dir')"
+        FEDERATION_HUB_ARCHIVE_DIRECTORY="$(yaml_read '.federation.hub.archive_dir')"
+        value="$(yaml_read '.federation.hub.max_report_age // 300')"
+        FEDERATION_HUB_MAX_REPORT_AGE="$((10#$value))"
+        value="$(yaml_read '.federation.hub.archive_retention_days // 0')"
+        FEDERATION_HUB_ARCHIVE_RETENTION_DAYS="$((10#$value))"
+        FEDERATION_HUB_STATE_FILE="${STATE_DIRECTORY}/federation-hub-state.json"
+    fi
 }
 
 load_command() {
@@ -1406,11 +1553,60 @@ send_webhook_notification() {
     return "$failed"
 }
 
+send_email_message() {
+    local event="$1" subject="$2" body="$3"
+    local encoded_subject message_file recipient recipients_header="" output command_status recipient_index
+    local -a curl_command
+
+    (( EMAIL_ENABLED == 1 )) || return 0
+    subject="${subject//$'\r'/ }"
+    subject="${subject//$'\n'/ }"
+    encoded_subject="$(printf '%s' "$subject" | base64 | tr -d '\r\n')"
+    message_file="${TEMP_DIRECTORY}/email-${RANDOM}-${RANDOM}.eml"
+    curl_command=(
+        curl
+        --silent
+        --show-error
+        --url "$EMAIL_SMTP_URL"
+        --connect-timeout "$EMAIL_TIMEOUT"
+        --max-time "$EMAIL_TIMEOUT"
+        --mail-from "$EMAIL_FROM"
+    )
+    (( EMAIL_TLS_REQUIRED == 1 )) && curl_command+=(--ssl-reqd)
+    (( EMAIL_INSECURE_SKIP_VERIFY == 1 )) && curl_command+=(--insecure)
+    [[ -z "$EMAIL_USERNAME" ]] || curl_command+=(--user "${EMAIL_USERNAME}:${EMAIL_PASSWORD}")
+    for ((recipient_index = 0; recipient_index < EMAIL_RECIPIENTS_COUNT; recipient_index++)); do
+        recipient="$(yaml_read ".notifications.email.recipients[$recipient_index]")"
+        curl_command+=(--mail-rcpt "$recipient")
+        [[ -z "$recipients_header" ]] || recipients_header+=", "
+        recipients_header+="$recipient"
+    done
+    {
+        printf 'From: %s\r\n' "$EMAIL_FROM"
+        printf 'To: %s\r\n' "$recipients_header"
+        printf 'Subject: =?UTF-8?B?%s?=\r\n' "$encoded_subject"
+        printf 'Date: %s\r\n' "$(date -R)"
+        printf 'MIME-Version: 1.0\r\n'
+        printf 'Content-Type: text/plain; charset=UTF-8\r\n'
+        printf 'Content-Transfer-Encoding: 8bit\r\n'
+        printf '\r\n%s\r\n' "$body"
+    } >"$message_file"
+    log INFO "service=${CURRENT_SERVICE} action=email event=${event} recipients=${EMAIL_RECIPIENTS_COUNT}"
+    output="$("${curl_command[@]}" --upload-file "$message_file" 2>&1)"
+    command_status=$?
+    rm -f -- "$message_file"
+    output="$(sanitize_detail "$output")"
+    if (( command_status == 0 )); then
+        log INFO "service=${CURRENT_SERVICE} result=email-sent event=${event} recipients=${EMAIL_RECIPIENTS_COUNT}"
+        return 0
+    fi
+    log ERROR "service=${CURRENT_SERVICE} result=email-failed event=${event} curl_exit=${command_status} error=${output:-unknown}"
+    return 1
+}
+
 send_email_notification() {
     local event="$1"
-    local timestamp subject_template body_template subject body encoded_subject
-    local message_file recipient recipients_header="" output command_status recipient_index
-    local -a curl_command
+    local timestamp subject_template body_template subject body
 
     (( EMAIL_ENABLED == 1 )) || return 0
     case "$event" in
@@ -1443,57 +1639,8 @@ send_email_notification() {
 
     timestamp="$(date '+%Y-%m-%d %H:%M:%S%z')"
     subject="$(render_email_template "$subject_template" "$event" "$timestamp")"
-    subject="${subject//$'\r'/ }"
-    subject="${subject//$'\n'/ }"
     body="$(render_email_template "$body_template" "$event" "$timestamp")"
-    encoded_subject="$(printf '%s' "$subject" | base64 | tr -d '\r\n')"
-    message_file="${TEMP_DIRECTORY}/email-${RANDOM}-${RANDOM}.eml"
-
-    curl_command=(
-        curl
-        --silent
-        --show-error
-        --url "$EMAIL_SMTP_URL"
-        --connect-timeout "$EMAIL_TIMEOUT"
-        --max-time "$EMAIL_TIMEOUT"
-        --mail-from "$EMAIL_FROM"
-    )
-    (( EMAIL_TLS_REQUIRED == 1 )) && curl_command+=(--ssl-reqd)
-    (( EMAIL_INSECURE_SKIP_VERIFY == 1 )) && curl_command+=(--insecure)
-    if [[ -n "$EMAIL_USERNAME" ]]; then
-        curl_command+=(--user "${EMAIL_USERNAME}:${EMAIL_PASSWORD}")
-    fi
-
-    for ((recipient_index = 0; recipient_index < EMAIL_RECIPIENTS_COUNT; recipient_index++)); do
-        recipient="$(yaml_read ".notifications.email.recipients[$recipient_index]")"
-        curl_command+=(--mail-rcpt "$recipient")
-        [[ -z "$recipients_header" ]] || recipients_header+=", "
-        recipients_header+="$recipient"
-    done
-
-    {
-        printf 'From: %s\r\n' "$EMAIL_FROM"
-        printf 'To: %s\r\n' "$recipients_header"
-        printf 'Subject: =?UTF-8?B?%s?=\r\n' "$encoded_subject"
-        printf 'Date: %s\r\n' "$(date -R)"
-        printf 'MIME-Version: 1.0\r\n'
-        printf 'Content-Type: text/plain; charset=UTF-8\r\n'
-        printf 'Content-Transfer-Encoding: 8bit\r\n'
-        printf '\r\n%s\r\n' "$body"
-    } >"$message_file"
-
-    log INFO "service=${CURRENT_SERVICE} action=email event=${event} recipients=${EMAIL_RECIPIENTS_COUNT}"
-    output="$("${curl_command[@]}" --upload-file "$message_file" 2>&1)"
-    command_status=$?
-    rm -f -- "$message_file"
-    output="$(sanitize_detail "$output")"
-
-    if (( command_status == 0 )); then
-        log INFO "service=${CURRENT_SERVICE} result=email-sent event=${event} recipients=${EMAIL_RECIPIENTS_COUNT}"
-        return 0
-    fi
-    log ERROR "service=${CURRENT_SERVICE} result=email-failed event=${event} curl_exit=${command_status} error=${output:-unknown}"
-    return 1
+    send_email_message "$event" "$subject" "$body"
 }
 
 http_status_is_successful() {
@@ -1827,11 +1974,370 @@ read_state() {
 write_state() {
     local service_name="$1" state="$2"
     local file temporary
+    [[ "$(read_state "$service_name")" == "$state" ]] || FEDERATION_STATE_CHANGED=1
     file="${STATE_DIRECTORY}/${service_name}.state"
     temporary="${file}.tmp.$$"
     printf '%s\n' "$state" >"$temporary" || die "Cannot write state: ${temporary}"
     chmod 0640 "$temporary" 2>/dev/null || true
     mv -f -- "$temporary" "$file" || die "Cannot update state: ${file}"
+}
+
+format_federation_timestamp() {
+    local epoch="$1"
+    if ! [[ "$epoch" =~ ^[0-9]+$ ]] || (( 10#$epoch == 0 )); then
+        printf ''
+        return 0
+    fi
+    date -u -d "@${epoch}" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || printf ''
+}
+
+federation_agent_overall_status() {
+    local service_count index service_name state has_degraded=0
+    service_count="$(yaml_read '.services | length')"
+    for ((index = 0; index < service_count; index++)); do
+        service_name="$(yaml_read ".services[$index].name")"
+        state="$(read_state "$service_name")"
+        [[ "$state" == unavailable ]] && { printf 'major_outage'; return 0; }
+        [[ "$state" == dependency_failed || "$state" == unknown ]] && has_degraded=1
+    done
+    if (( has_degraded == 1 )); then
+        printf 'degraded'
+    else
+        printf 'operational'
+    fi
+}
+
+federation_agent_build_report() {
+    local service_count index service_name check_type state last_check last_transition overall hostname_value
+    service_count="$(yaml_read '.services | length')"
+    overall="$(federation_agent_overall_status)"
+    hostname_value="$(hostname 2>/dev/null || hostname -s)"
+    printf '{\n  "node_id": "%s",\n  "timestamp": "%s",\n  "hostname": "%s",\n' \
+        "$(escape_json "$FEDERATION_NODE_ID")" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$(escape_json "$hostname_value")"
+    printf '  "watchdog_version": "%s",\n  "overall_status": "%s",\n  "services": [\n' \
+        "$(escape_json "$WATCHDOG_VERSION")" "$overall"
+    for ((index = 0; index < service_count; index++)); do
+        service_name="$(yaml_read ".services[$index].name")"
+        check_type="$(yaml_read ".services[$index].check.type")"
+        state="$(read_state "$service_name")"
+        last_check="$(read_service_marker_number "$service_name" last-check 0)"
+        last_transition="$(read_service_marker_number "$service_name" last-transition 0)"
+        printf '    {"name":"%s","state":"%s","check_type":"%s","last_check":"%s","last_transition":"%s","detail":""}%s\n' \
+            "$(escape_json "$service_name")" "$state" "$(escape_json "$check_type")" \
+            "$(format_federation_timestamp "$last_check")" "$(format_federation_timestamp "$last_transition")" \
+            "$([[ $index -lt $((service_count - 1)) ]] && printf ',')"
+    done
+    printf '  ]\n}\n'
+}
+
+federation_agent_should_report() {
+    local service_count index service_name state overall marker previous=""
+    (( FEDERATION_AGENT_HEARTBEAT == 1 )) && return 0
+    service_count="$(yaml_read '.services | length')"
+    for ((index = 0; index < service_count; index++)); do
+        service_name="$(yaml_read ".services[$index].name")"
+        state="$(read_state "$service_name")"
+        [[ "$state" == unavailable || "$state" == dependency_failed ]] && return 0
+    done
+    marker="${STATE_DIRECTORY}/federation-last-report-overall"
+    if [[ -r "$marker" ]]; then
+        IFS= read -r previous <"$marker" || true
+    fi
+    overall="$(federation_agent_overall_status)"
+    [[ -z "$previous" || "$previous" != "$overall" || "$FEDERATION_STATE_CHANGED" == 1 ]]
+}
+
+federation_agent_record_report() {
+    local overall="$1" file temporary
+    file="${STATE_DIRECTORY}/federation-last-report-overall"
+    temporary="${file}.tmp.$$"
+    printf '%s\n' "$overall" >"$temporary" || return 1
+    chmod 0640 "$temporary" 2>/dev/null || true
+    mv -f -- "$temporary" "$file"
+}
+
+federation_agent_send_report() {
+    local report report_file response_file error_file http_status curl_status token="" result duration_start duration_end
+    local overall bytes temporary
+    local -a curl_command
+
+    (( FEDERATION_AGENT_ENABLED == 1 )) || return 0
+    if (( DRY_RUN == 1 )); then
+        log INFO "federation=agent node=${FEDERATION_NODE_ID} result=skipped reason=dry_run"
+        return 0
+    fi
+    if ! federation_agent_should_report; then
+        log INFO "federation=agent node=${FEDERATION_NODE_ID} result=skipped reason=heartbeat_disabled all_healthy=true"
+        return 0
+    fi
+    report="$(federation_agent_build_report)"
+    overall="$(federation_agent_overall_status)"
+    bytes="${#report}"
+    duration_start="$(date '+%s%3N')"
+    if [[ "$FEDERATION_AGENT_TRANSPORT" == file ]]; then
+        if ! mkdir -p -- "$(dirname -- "$FEDERATION_AGENT_REPORT_PATH")" 2>/dev/null; then
+            log ERROR "federation=agent node=${FEDERATION_NODE_ID} transport=file result=failed reason=directory path=${FEDERATION_AGENT_REPORT_PATH}"
+            return 0
+        fi
+        temporary="${FEDERATION_AGENT_REPORT_PATH}.tmp.$$"
+        if printf '%s\n' "$report" >"$temporary" && chmod 0640 "$temporary" 2>/dev/null && mv -f -- "$temporary" "$FEDERATION_AGENT_REPORT_PATH"; then
+            federation_agent_record_report "$overall" || log WARN "federation=agent node=${FEDERATION_NODE_ID} result=marker-write-failed"
+            log INFO "federation=agent node=${FEDERATION_NODE_ID} transport=file result=written path=${FEDERATION_AGENT_REPORT_PATH} bytes=${bytes}"
+        else
+            rm -f -- "$temporary"
+            log ERROR "federation=agent node=${FEDERATION_NODE_ID} transport=file result=failed path=${FEDERATION_AGENT_REPORT_PATH}"
+        fi
+        return 0
+    fi
+
+    token="${!FEDERATION_AGENT_TOKEN_ENV:-}"
+    if [[ -z "$token" ]]; then
+        log ERROR "federation=agent node=${FEDERATION_NODE_ID} transport=http result=failed reason=missing-env:${FEDERATION_AGENT_TOKEN_ENV}"
+        return 0
+    fi
+    report_file="${TEMP_DIRECTORY}/federation-report.json"
+    response_file="${TEMP_DIRECTORY}/federation-response.txt"
+    error_file="${TEMP_DIRECTORY}/federation-error.txt"
+    printf '%s\n' "$report" >"$report_file"
+    curl_command=(curl --silent --show-error --output "$response_file" --write-out '%{http_code}' --request POST
+        --header 'Content-Type: application/json' --header "Authorization: Bearer ${token}"
+        --connect-timeout "$FEDERATION_AGENT_TIMEOUT" --max-time "$FEDERATION_AGENT_TIMEOUT")
+    http_status="$("${curl_command[@]}" --data-binary "@${report_file}" "$FEDERATION_AGENT_HUB_URL" 2>"$error_file")"
+    curl_status=$?
+    duration_end="$(date '+%s%3N')"
+    if (( curl_status == 0 )) && [[ "$http_status" =~ ^2[0-9][0-9]$ ]]; then
+        federation_agent_record_report "$overall" || log WARN "federation=agent node=${FEDERATION_NODE_ID} result=marker-write-failed"
+        log INFO "federation=agent node=${FEDERATION_NODE_ID} transport=http result=sent bytes=${bytes} duration_ms=$((duration_end - duration_start)) status=${http_status}"
+    else
+        result=""
+        [[ -s "$error_file" ]] && result="$(sanitize_detail "$(<"$error_file")")"
+        [[ -n "$result" || ! -s "$response_file" ]] || result="$(sanitize_detail "$(<"$response_file")")"
+        log ERROR "federation=agent node=${FEDERATION_NODE_ID} transport=http result=failed status=${http_status:-000} curl_exit=${curl_status} error=${result:-unknown}"
+    fi
+}
+
+federation_hub_state_value() {
+    local node_id="$1" field="$2" fallback="$3" value=""
+    [[ -r "$FEDERATION_HUB_STATE_FILE" ]] || { printf '%s' "$fallback"; return 0; }
+    value="$(yq eval -r ".agents.\"${node_id}\".${field} // \"\"" "$FEDERATION_HUB_STATE_FILE" 2>/dev/null)" || value=""
+    [[ -n "$value" && "$value" != null ]] || value="$fallback"
+    printf '%s' "$value"
+}
+
+federation_hub_render_template() {
+    local template="$1" overall="$2" previous="$3" timestamp="$4" node_id="$5" age="$6"
+    template="${template//\{\{overall_status\}\}/$overall}"
+    template="${template//\{\{previous_status\}\}/$previous}"
+    template="${template//\{\{timestamp\}\}/$timestamp}"
+    template="${template//\{\{node_id\}\}/$node_id}"
+    template="${template//\{\{age_seconds\}\}/$age}"
+    template="${template//\{\{unhealthy_services\}\}/$FEDERATION_HUB_UNHEALTHY_SERVICES}"
+    template="${template//\{\{offline_nodes\}\}/$FEDERATION_HUB_OFFLINE_NODES}"
+    template="${template//\{\{#unhealthy_services\}\}/}"
+    template="${template//\{\{/unhealthy_services\}\}/}"
+    template="${template//\{\{#offline_nodes\}\}/}"
+    template="${template//\{\{/offline_nodes\}\}/}"
+    printf '%s' "$template"
+}
+
+federation_hub_notify() {
+    local event="$1" overall="$2" previous="$3" node_id="${4:-}" age="${5:-0}"
+    local subject_template body_template subject body timestamp webhook_event
+    case "$event" in
+        overall_failure)
+            subject_template='[FEDERATION] Infrastructure status: {{overall_status}}'
+            body_template=$'Overall status changed to {{overall_status}}.\n\nUnhealthy services:\n{{unhealthy_services}}\nOffline agents:\n{{offline_nodes}}'
+            webhook_event=failure
+            ;;
+        overall_recovery)
+            subject_template='[FEDERATION] Infrastructure recovered: {{overall_status}}'
+            body_template='All services are operational. Previously: {{previous_status}}'
+            webhook_event=recovery
+            ;;
+        agent_offline)
+            subject_template='[FEDERATION] Agent {{node_id}} is offline'
+            body_template='Agent {{node_id}} has not reported for {{age_seconds}} seconds.'
+            webhook_event=failure
+            ;;
+        agent_online)
+            subject_template='[FEDERATION] Agent {{node_id}} is online'
+            body_template='Agent {{node_id}} is reporting again.'
+            webhook_event=recovery
+            ;;
+        service_change)
+            subject_template='[FEDERATION] Service state change on {{node_id}}'
+            body_template=$'A service state changed on {{node_id}}.\n\nUnhealthy services:\n{{unhealthy_services}}'
+            webhook_event=failure
+            ;;
+        *) return 1 ;;
+    esac
+    [[ "$(yaml_read ".federation.hub.templates.${event}.subject // \"\"")" == "" ]] || subject_template="$(yaml_read ".federation.hub.templates.${event}.subject")"
+    [[ "$(yaml_read ".federation.hub.templates.${event}.body // \"\"")" == "" ]] || body_template="$(yaml_read ".federation.hub.templates.${event}.body")"
+    timestamp="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    subject="$(federation_hub_render_template "$subject_template" "$overall" "$previous" "$timestamp" "$node_id" "$age")"
+    body="$(federation_hub_render_template "$body_template" "$overall" "$previous" "$timestamp" "$node_id" "$age")"
+    CURRENT_SERVICE="federation"; CURRENT_CHECK_TYPE="federation"; CURRENT_ACTION_STATUS="not-applicable"; CHECK_DETAIL="$body"
+    send_email_message "$event" "$subject" "$body" || log ERROR "federation=hub result=email-failed event=${event}"
+    send_webhook_notification "$webhook_event" || log ERROR "federation=hub result=webhook-failed event=${event}"
+}
+
+federation_hub_write_state() {
+    local overall="$1" status_name="$2" seen_name="$3" fingerprint_name="$4"
+    local -n status_ref="$status_name" seen_ref="$seen_name" fingerprint_ref="$fingerprint_name"
+    local temporary node_id comma=""
+    temporary="${FEDERATION_HUB_STATE_FILE}.tmp.$$"
+    {
+        printf '{\n  "last_run": "%s",\n  "last_overall_status": "%s",\n  "agents": {' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$overall"
+        for node_id in "${!status_ref[@]}"; do
+            printf '%s\n    "%s": {"last_seen":"%s","last_status":"%s","service_fingerprint":"%s"}' \
+                "$comma" "$(escape_json "$node_id")" "$(escape_json "${seen_ref[$node_id]:-}")" \
+                "$(escape_json "${status_ref[$node_id]}")" "$(escape_json "${fingerprint_ref[$node_id]:-}")"
+            comma=,
+        done
+        printf '\n  }\n}\n'
+    } >"$temporary" || { rm -f -- "$temporary"; return 1; }
+    chmod 0640 "$temporary" 2>/dev/null || true
+    mv -f -- "$temporary" "$FEDERATION_HUB_STATE_FILE"
+}
+
+federation_hub_generate_summary() {
+    if [[ -z "$FEDERATION_HUB_UNHEALTHY_SERVICES" ]]; then
+        FEDERATION_HUB_UNHEALTHY_SERVICES='- none'
+    fi
+    if [[ -z "$FEDERATION_HUB_OFFLINE_NODES" ]]; then
+        FEDERATION_HUB_OFFLINE_NODES='- none'
+    fi
+}
+
+federation_hub_process_reports() {
+    local report_file node_id json_node timestamp timestamp_epoch now age service_count service_index service_name service_state last_transition
+    local reports_processed=0 valid_reports=0 invalid_reports=0 fresh_reports=0 moved=0 deleted=0 previous_overall overall
+    local expected_count expected_index expected_node previous_agent_status previous_fingerprint fingerprint stale_seen stale_epoch
+    local has_degraded=0 has_unavailable=0 archive_target
+    local -a valid_files=() expected_nodes=()
+    local -A selected_file=() selected_epoch=() selected_timestamp=() file_node=() fresh_status=() fresh_fingerprint=()
+    local -A agent_status=() agent_seen=() agent_fingerprint=()
+
+    if ! mkdir -p -- "$FEDERATION_HUB_INCOMING_DIRECTORY" "$FEDERATION_HUB_ARCHIVE_DIRECTORY" 2>/dev/null; then
+        log ERROR "federation=hub result=failed reason=directory"
+        FEDERATION_HUB_OVERALL_STATUS=unknown
+        return 0
+    fi
+    now="$(date '+%s')"
+    for report_file in "$FEDERATION_HUB_INCOMING_DIRECTORY"/*.json; do
+        [[ -f "$report_file" ]] || continue
+        ((reports_processed++))
+        node_id="${report_file##*/}"; node_id="${node_id%.json}"
+        if ! [[ "$node_id" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || ! yq eval -e '.' "$report_file" >/dev/null 2>&1; then
+            ((invalid_reports++)); log WARN "federation=hub file=${report_file} result=invalid"; continue
+        fi
+        json_node="$(yq eval -r '.node_id // ""' "$report_file" 2>/dev/null)"
+        timestamp="$(yq eval -r '.timestamp // ""' "$report_file" 2>/dev/null)"
+        if [[ "$json_node" != "$node_id" ]] || ! timestamp_epoch="$(date -u -d "$timestamp" '+%s' 2>/dev/null)" || ! [[ "$timestamp_epoch" =~ ^[0-9]+$ ]] || [[ "$(yq eval '.services | type' "$report_file" 2>/dev/null)" != '!!seq' ]]; then
+            ((invalid_reports++)); log WARN "federation=hub node=${node_id} result=invalid"; continue
+        fi
+        ((valid_reports++)); valid_files+=("$report_file"); file_node["$report_file"]="$node_id"
+        if [[ -z "${selected_epoch[$node_id]:-}" || 10#$timestamp_epoch -gt 10#${selected_epoch[$node_id]} ]]; then
+            selected_file["$node_id"]="$report_file"; selected_epoch["$node_id"]="$timestamp_epoch"; selected_timestamp["$node_id"]="$timestamp"
+        fi
+    done
+
+    FEDERATION_HUB_UNHEALTHY_SERVICES=""; FEDERATION_HUB_OFFLINE_NODES=""
+    for node_id in "${!selected_file[@]}"; do
+        report_file="${selected_file[$node_id]}"; timestamp_epoch="${selected_epoch[$node_id]}"; timestamp="${selected_timestamp[$node_id]}"
+        age=$((now - 10#$timestamp_epoch)); (( age < 0 )) && age=0
+        if (( age > FEDERATION_HUB_MAX_REPORT_AGE )); then
+            log WARN "federation=hub node=${node_id} result=offline age=${age}s max_age=${FEDERATION_HUB_MAX_REPORT_AGE}s"
+            continue
+        fi
+        ((fresh_reports++)); service_count="$(yq eval '.services | length' "$report_file")"; fingerprint=""
+        fresh_status["$node_id"]=operational
+        for ((service_index = 0; service_index < service_count; service_index++)); do
+            service_name="$(yq eval -r ".services[$service_index].name // \"unnamed-${service_index}\"" "$report_file")"
+            service_state="$(yq eval -r ".services[$service_index].state // \"unknown\"" "$report_file")"
+            last_transition="$(yq eval -r ".services[$service_index].last_transition // \"unknown\"" "$report_file")"
+            case "$service_state" in healthy|unavailable|dependency_failed|unknown) ;; *) service_state=unknown ;; esac
+            fingerprint+="${service_name}:${service_state};"
+            if [[ "$service_state" == unavailable ]]; then
+                fresh_status["$node_id"]=major_outage; has_unavailable=1
+            elif [[ "$service_state" != healthy && "${fresh_status[$node_id]}" != major_outage ]]; then
+                fresh_status["$node_id"]=degraded; has_degraded=1
+            fi
+            [[ "$service_state" == healthy ]] || FEDERATION_HUB_UNHEALTHY_SERVICES+="- [${node_id}] ${service_name}: ${service_state} (since ${last_transition})"$'\n'
+        done
+        fresh_fingerprint["$node_id"]="$fingerprint"; agent_status["$node_id"]="${fresh_status[$node_id]}"; agent_seen["$node_id"]="$timestamp"; agent_fingerprint["$node_id"]="$fingerprint"
+        log INFO "federation=hub node=${node_id} result=online status=${fresh_status[$node_id]}"
+    done
+
+    expected_count="$(yaml_read '.federation.hub.expected_nodes // [] | length')"
+    for ((expected_index = 0; expected_index < expected_count; expected_index++)); do expected_nodes+=("$(yaml_read ".federation.hub.expected_nodes[$expected_index]")"); done
+    previous_overall=unknown
+    [[ -r "$FEDERATION_HUB_STATE_FILE" ]] && previous_overall="$(yq eval -r '.last_overall_status // "unknown"' "$FEDERATION_HUB_STATE_FILE" 2>/dev/null || printf unknown)"
+    for expected_node in "${expected_nodes[@]}"; do
+        previous_agent_status="$(federation_hub_state_value "$expected_node" last_status unknown)"
+        if [[ -n "${fresh_status[$expected_node]:-}" ]]; then
+            if [[ "$previous_agent_status" == offline ]]; then
+                log INFO "federation=hub node=${expected_node} result=online action=recovered"
+                if [[ "$(yaml_read '.federation.hub.notify_on.agent_offline // true')" == true && "$DRY_RUN" == 0 ]]; then
+                    federation_hub_notify agent_online "${fresh_status[$expected_node]}" "$previous_overall" "$expected_node" 0
+                fi
+            fi
+            continue
+        fi
+        stale_seen="${selected_timestamp[$expected_node]:-$(federation_hub_state_value "$expected_node" last_seen unknown)}"
+        stale_epoch="${selected_epoch[$expected_node]:-0}"
+        if [[ "$stale_epoch" =~ ^[0-9]+$ ]] && (( 10#$stale_epoch > 0 )); then age=$((now - 10#$stale_epoch)); (( age < 0 )) && age=0; else age=$((FEDERATION_HUB_MAX_REPORT_AGE + 1)); fi
+        agent_status["$expected_node"]=offline; agent_seen["$expected_node"]="$stale_seen"; agent_fingerprint["$expected_node"]=""
+        FEDERATION_HUB_OFFLINE_NODES+="- ${expected_node} (last seen ${stale_seen})"$'\n'
+        if [[ "$previous_agent_status" != offline ]]; then
+            log WARN "federation=hub notify=agent_offline node=${expected_node} age=${age}s"
+            if [[ "$(yaml_read '.federation.hub.notify_on.agent_offline // true')" == true && "$DRY_RUN" == 0 ]]; then
+                federation_hub_notify agent_offline degraded "$previous_overall" "$expected_node" "$age"
+            fi
+        fi
+    done
+
+    if (( fresh_reports == 0 )); then overall=unknown
+    elif (( has_unavailable == 1 )); then overall=major_outage
+    elif (( has_degraded == 1 )); then overall=degraded
+    else overall=operational; fi
+    # Offline expected agents also make the infrastructure degraded, even when
+    # every fresh report is healthy.
+    [[ -z "$FEDERATION_HUB_OFFLINE_NODES" || "$overall" != operational ]] || overall=degraded
+    FEDERATION_HUB_OVERALL_STATUS="$overall"
+    federation_hub_generate_summary
+    if [[ "$previous_overall" != "$overall" ]]; then
+        if [[ "$(yaml_read '.federation.hub.notify_on.overall_change // true')" == true && "$DRY_RUN" == 0 && ! ( "$previous_overall" == unknown && "$overall" == operational ) ]]; then
+            if [[ "$overall" == operational ]]; then federation_hub_notify overall_recovery "$overall" "$previous_overall"; else federation_hub_notify overall_failure "$overall" "$previous_overall"; fi
+            log INFO "federation=hub overall_status=${overall} previous=${previous_overall} action=notify"
+        else
+            log INFO "federation=hub overall_status=${overall} previous=${previous_overall} action=record"
+        fi
+    fi
+    if [[ "$(yaml_read '.federation.hub.notify_on.any_service_change // false')" == true && "$DRY_RUN" == 0 ]]; then
+        for node_id in "${!fresh_fingerprint[@]}"; do
+            previous_fingerprint="$(federation_hub_state_value "$node_id" service_fingerprint "")"
+            if [[ -n "$previous_fingerprint" && "$previous_fingerprint" != "${fresh_fingerprint[$node_id]}" && "$previous_overall" == "$overall" ]]; then
+                log INFO "federation=hub notify=service_change node=${node_id}"
+                federation_hub_notify service_change "$overall" "$previous_overall" "$node_id"
+            fi
+        done
+    fi
+    if (( DRY_RUN == 0 )); then
+        federation_hub_write_state "$overall" agent_status agent_seen agent_fingerprint || log ERROR "federation=hub result=state-write-failed"
+        for report_file in "${valid_files[@]}"; do
+            node_id="${file_node[$report_file]}"; timestamp="$(yq eval -r '.timestamp' "$report_file")"
+            archive_target="${FEDERATION_HUB_ARCHIVE_DIRECTORY}/${node_id}_${timestamp}.json"
+            [[ ! -e "$archive_target" ]] || archive_target="${FEDERATION_HUB_ARCHIVE_DIRECTORY}/${node_id}_${timestamp}.$$.json"
+            if mv -f -- "$report_file" "$archive_target"; then ((moved++)); else log ERROR "federation=hub archive=failed file=${report_file}"; fi
+        done
+        if (( FEDERATION_HUB_ARCHIVE_RETENTION_DAYS > 0 )); then
+            deleted="$(find "$FEDERATION_HUB_ARCHIVE_DIRECTORY" -type f -name '*.json' -mtime "+${FEDERATION_HUB_ARCHIVE_RETENTION_DAYS}" -print 2>/dev/null | awk 'END { print NR }')"
+            find "$FEDERATION_HUB_ARCHIVE_DIRECTORY" -type f -name '*.json' -mtime "+${FEDERATION_HUB_ARCHIVE_RETENTION_DAYS}" -delete 2>/dev/null || log ERROR "federation=hub archive=retention-failed"
+        fi
+    fi
+    log INFO "federation=hub reports_processed=${reports_processed} valid=${valid_reports} invalid=${invalid_reports}"
+    log INFO "federation=hub archive=done moved=${moved} deleted_old=${deleted}"
 }
 
 action_is_due() {
@@ -2561,7 +3067,7 @@ main() {
     done
 
     [[ -f "$CONFIG_FILE" ]] || die "Configuration file not found: ${CONFIG_FILE}"
-    for name in bash base64 curl yq flock timeout date dirname mktemp tail tr mv env awk df; do
+    for name in bash base64 curl yq flock timeout date dirname mktemp tail tr mv env awk df hostname find; do
         require_command "$name"
     done
     yq_version="$(yq --version 2>/dev/null)" || die "Cannot determine yq version."
@@ -2576,6 +3082,7 @@ main() {
     configure_email
     configure_metrics
     configure_status_page
+    configure_federation
     if (( PARALLEL_ENABLED == 1 )); then
         TEMP_DIRECTORY="$(mktemp -d "${PARALLEL_TEMP_BASE%/}/watchdog.XXXXXX")" || die "Cannot create parallel temporary directory."
     else
@@ -2589,6 +3096,15 @@ main() {
 
     log_template_expansions
     log INFO "action=watchdog-start config=${CONFIG_FILE} dry_run=${DRY_RUN}"
+    if (( FEDERATION_HUB_ENABLED == 1 )); then
+        federation_hub_process_reports
+        if [[ "$FEDERATION_HUB_OVERALL_STATUS" == operational ]]; then
+            log INFO "action=watchdog-finish mode=federation-hub exit=0 overall=operational"
+            exit 0
+        fi
+        log WARN "action=watchdog-finish mode=federation-hub exit=1 overall=${FEDERATION_HUB_OVERALL_STATUS}"
+        exit 1
+    fi
     service_count="$(yaml_read '.services | length')"
     if [[ -n "$ONLY_SERVICE" ]]; then
         for ((index = 0; index < service_count; index++)); do
@@ -2601,6 +3117,7 @@ main() {
     RESOLVED_STATE=()
     CONDITION_SKIPPED=()
     CONDITION_EVALUATED=()
+    FEDERATION_STATE_CHANGED=0
     if (( PARALLEL_ENABLED == 1 )); then
         local max_level=0 level
         for name in "${SERVICE_ORDER[@]}"; do
@@ -2622,6 +3139,7 @@ main() {
 
     write_prometheus_metrics
     generate_status_page
+    federation_agent_send_report
 
     if (( UNHEALTHY_FOUND == 1 || ACTION_ATTEMPTED == 1 )); then
         log WARN "action=watchdog-finish exit=1 unhealthy=${UNHEALTHY_FOUND} remediation=${ACTION_ATTEMPTED}"

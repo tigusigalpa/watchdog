@@ -20,6 +20,57 @@ parallel:
   # Empty uses /tmp/watchdog. Set a writable absolute directory if needed.
   temp_dir: ""
 
+# Optional distributed monitoring. Run the agent and hub as separate one-shot
+# watchdog instances; the hub never opens an HTTP port itself.
+federation:
+  enabled: false
+  # Empty uses `hostname -s`.
+  node_id: web-01
+
+  # Agent configuration: send the local snapshot after all checks finish.
+  agent:
+    enabled: false
+    transport: http
+    hub_url: https://watchdog-hub.internal/api/v1/report
+    token_env: WATCHDOG_HUB_TOKEN
+    timeout: 10
+    report_path: /var/lib/service-watchdog/federation-report.json
+    # Set transport: file to atomically write report_path. Deliver it with
+    # rsync, scp, Syncthing, S3, or another external transport.
+    heartbeat: true
+
+  # Hub configuration: use this in a separate config with `services: []`.
+  hub:
+    enabled: false
+    incoming_dir: /var/lib/watchdog-hub/incoming
+    archive_dir: /var/lib/watchdog-hub/archive
+    max_report_age: 300
+    archive_retention_days: 7
+    expected_nodes:
+      - web-01
+      - web-02
+    notify_on:
+      overall_change: true
+      agent_offline: true
+      any_service_change: false
+    templates:
+      overall_failure:
+        subject: "[FEDERATION] Infrastructure status: {{overall_status}}"
+        body: |-
+          Overall status changed to {{overall_status}}.
+
+          Unhealthy services:
+          {{unhealthy_services}}
+
+          Offline agents:
+          {{offline_nodes}}
+      overall_recovery:
+        subject: "[FEDERATION] Infrastructure recovered: {{overall_status}}"
+        body: "All services are operational. Previously: {{previous_status}}"
+      agent_offline:
+        subject: "[FEDERATION] Agent {{node_id}} is offline"
+        body: "Agent {{node_id}} has not reported for {{age_seconds}} seconds."
+
 # Optional Prometheus node_exporter textfile collector integration.
 metrics:
   enabled: false

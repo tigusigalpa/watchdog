@@ -695,6 +695,106 @@ useful for small configurations but can overload DNS, file descriptors, or the
 services being monitored. Check worker output and results are isolated in a
 temporary directory, then replayed in service order by the main process.
 
+### Federation / Distributed Monitoring
+
+Federation keeps local checks local while sending a compact snapshot to a
+central one-shot hub. Agents never receive commands from the hub, and the hub
+does not open a listening port. It reads reports that an existing delivery
+mechanism has placed in its incoming directory, then sends one consolidated
+transition notification through the usual email and webhook configuration.
+
+```text
+┌───────────┐
+│ Agent × N │ ── HTTP POST or file delivery ──> ┌──────────────┐
+│ watchdog  │                                   │ Hub watchdog │ ──> summary alerts
+└───────────┘                                   └──────────────┘
+```
+
+Enable the agent on each monitored host. With `heartbeat: true` (recommended),
+it reports on every run so the hub can distinguish a healthy host from an
+offline one. With `heartbeat: false`, it reports an initial snapshot and then
+only after a local state transition or while a service remains unavailable or
+dependency-failed.
+
+```yaml
+federation:
+  enabled: true
+  node_id: web-01                 # omit to use `hostname -s`
+  agent:
+    enabled: true
+    transport: http
+    hub_url: https://reports.example.internal/api/v1/report
+    token_env: WATCHDOG_HUB_TOKEN
+    timeout: 10
+    heartbeat: true
+  hub:
+    enabled: false
+```
+
+For HTTP delivery, point `hub_url` at an existing authenticated receiver behind
+nginx, Caddy, or another reverse proxy. That receiver must validate the bearer
+token and atomically write the request body as `{node_id}.json` in the hub's
+`incoming_dir`; Watchdog deliberately does not implement an HTTP server.
+
+For file delivery, set `transport: file` and provide an absolute `report_path`.
+The agent writes it atomically. Use rsync, scp, Syncthing, S3 synchronization,
+or your preferred deployment tool to deliver it to the hub as
+`{node_id}.json`.
+
+Run the hub with its own configuration and an empty service list. It accepts
+only JSON whose filename matches its `node_id`, chooses the newest report for
+each node by the timestamp inside it, archives valid inputs, and marks expected
+nodes offline after `max_report_age` seconds. `major_outage` means at least one
+reported service is unavailable; `degraded` means a dependency failure,
+unknown service state, or expected offline agent; and `unknown` means no fresh
+valid report exists.
+
+```yaml
+services: []
+
+federation:
+  enabled: true
+  hub:
+    enabled: true
+    incoming_dir: /var/lib/watchdog-hub/incoming
+    archive_dir: /var/lib/watchdog-hub/archive
+    max_report_age: 300
+    archive_retention_days: 7
+    expected_nodes: [web-01, web-02]
+    notify_on:
+      overall_change: true
+      agent_offline: true
+      any_service_change: false
+```
+
+The hub stores its aggregate state in
+`settings.state_directory/federation-hub-state.json`. Its optional templates
+support `{{overall_status}}`, `{{previous_status}}`, `{{timestamp}}`,
+`{{unhealthy_services}}`, `{{offline_nodes}}`, `{{node_id}}`, and
+`{{age_seconds}}`. Email uses these templates directly; enabled webhook
+providers receive the corresponding failure or recovery event.
+
+A hub is scheduled just like an ordinary watchdog run. For example, create a
+separate `watchdog-hub.service` whose `ExecStart` points to the hub config, and
+use this timer:
+
+```ini
+# /etc/systemd/system/watchdog-hub.timer
+[Unit]
+Description=Run Watchdog federation hub
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=1min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+```
+
+The hub is still a one-shot process: it exits after processing the current
+directory and leaves no port open.
+
 ### Circuit Breaker
 
 Circuit breaker prevents a persistently broken service from repeatedly
@@ -931,8 +1031,8 @@ configured timeout before increasing the schedule interval.
 
 ```bash
 bash -n service-watchdog.sh install.sh tests/smoke.sh
-bash -n tests/email-notifications.sh tests/webhooks.sh tests/maintenance.sh tests/escalation.sh tests/prometheus.sh tests/dependencies.sh tests/circuit-breaker.sh tests/status-page.sh
-shellcheck service-watchdog.sh install.sh tests/smoke.sh tests/email-notifications.sh tests/webhooks.sh tests/maintenance.sh tests/escalation.sh tests/prometheus.sh tests/dependencies.sh tests/circuit-breaker.sh tests/status-page.sh
+bash -n tests/email-notifications.sh tests/webhooks.sh tests/maintenance.sh tests/escalation.sh tests/prometheus.sh tests/dependencies.sh tests/circuit-breaker.sh tests/status-page.sh tests/federation.sh
+shellcheck service-watchdog.sh install.sh tests/smoke.sh tests/email-notifications.sh tests/webhooks.sh tests/maintenance.sh tests/escalation.sh tests/prometheus.sh tests/dependencies.sh tests/circuit-breaker.sh tests/status-page.sh tests/federation.sh
 bash ./tests/smoke.sh
 bash ./tests/email-notifications.sh
 bash ./tests/webhooks.sh
@@ -942,6 +1042,7 @@ bash ./tests/prometheus.sh
 bash ./tests/dependencies.sh
 bash ./tests/circuit-breaker.sh
 bash ./tests/status-page.sh
+bash ./tests/federation.sh
 ```
 
 The smoke test starts a local HTTP server and verifies both the healthy path and
