@@ -44,7 +44,6 @@ STATUS_PAGE_ENABLED=0
 STATUS_PAGE_DIRECTORY=""
 STATUS_PAGE_HTML_FILENAME="index.html"
 STATUS_PAGE_JSON_FILENAME=""
-FEDERATION_ENABLED=0
 FEDERATION_AGENT_ENABLED=0
 FEDERATION_HUB_ENABLED=0
 FEDERATION_NODE_ID=""
@@ -1138,7 +1137,6 @@ configure_federation() {
     local value
 
     [[ "$(yaml_read '.federation.enabled // false')" == true ]] || return 0
-    FEDERATION_ENABLED=1
     FEDERATION_NODE_ID="$(yaml_read '.federation.node_id // ""')"
     [[ -n "$FEDERATION_NODE_ID" ]] || FEDERATION_NODE_ID="$(hostname -s)"
 
@@ -2209,6 +2207,7 @@ federation_hub_generate_summary() {
     fi
 }
 
+# shellcheck disable=SC2034 # The maps below are consumed through namerefs by federation_hub_write_state.
 federation_hub_process_reports() {
     local report_file node_id json_node timestamp timestamp_epoch now age service_count service_index service_name service_state last_transition
     local reports_processed=0 valid_reports=0 invalid_reports=0 fresh_reports=0 moved=0 deleted=0 previous_overall overall
@@ -2237,7 +2236,7 @@ federation_hub_process_reports() {
             ((invalid_reports++)); log WARN "federation=hub node=${node_id} result=invalid"; continue
         fi
         ((valid_reports++)); valid_files+=("$report_file"); file_node["$report_file"]="$node_id"
-        if [[ -z "${selected_epoch[$node_id]:-}" || 10#$timestamp_epoch -gt 10#${selected_epoch[$node_id]} ]]; then
+        if [[ -z "${selected_epoch[$node_id]:-}" ]] || (( 10#$timestamp_epoch > 10#${selected_epoch[$node_id]} )); then
             selected_file["$node_id"]="$report_file"; selected_epoch["$node_id"]="$timestamp_epoch"; selected_timestamp["$node_id"]="$timestamp"
         fi
     done
